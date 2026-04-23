@@ -1,288 +1,91 @@
-# Problem Statement
+# Visual Kubernetes
 
-## The Problem in One Sentence
-Engineers are forced to become infrastructure experts to practice system design, when platforms should remove that burden instead.
+Visual Kubernetes is an MVP for the idea described in the original concept note: a visual-first architecture workspace that lets engineers model a system, validate the design, and generate the infrastructure story without writing Kubernetes YAML by hand.
 
----
+## What is implemented
 
-## The Core Issue (Plain, Honest)
+- Interactive React + TypeScript frontend built with Vite
+- Visual architecture canvas rendered from a typed system model
+- Drag-and-drop node repositioning on the canvas
+- Property panel for editing selected components
+- Local workspace persistence with `localStorage`
+- Domain engine that:
+  - Detects architecture pattern (`monolith`, `microservices`, `event-driven`, `hybrid`)
+  - Validates invalid relationships and risky topology choices
+  - Generates a deployment summary and Kubernetes object inventory
+  - Exports Kubernetes YAML from the visual model
+- Automated tests for engine behavior and a UI smoke flow
+- GitHub Actions CI for install, lint, test, and build
 
-Modern infrastructure platforms like Kubernetes consume so much cognitive bandwidth that most engineers spend their time learning the platform instead of designing resilient systems.
+## Current MVP scope
 
-**The result:**
-- System design skills develop slowly
-- Iteration cycles are long
-- Mistakes repeat at higher layers
-- Only a small subset of engineers reach true systems competence
-- Organizations confuse "platform fluency" with "architectural judgment"
+The current app models four infrastructure primitives:
 
----
+- `ingress`
+- `service`
+- `database`
+- `queue`
 
-## Why This Matters: Four Concrete Failures
+It also supports three relationship types:
 
-### 1. Cognitive Bandwidth Misallocation
-Engineers invest months (or years) mastering:
-- Kubernetes internals and configuration semantics
-- Ecosystem tooling and operational patterns
-- Failure behaviors that only surface at scale
+- `http`
+- `async`
+- `data`
 
-This time investment does not transfer across technologies and directly reduces time available for:
-- Tradeoff analysis and design reasoning
-- Failure modeling and resilience thinking
-- Cost reasoning and resource efficiency
-- Boundary and abstraction design
+This is intentionally a narrow first slice. It establishes the product shape and the engineering baseline before expanding into topology editing, persistence beyond the browser, simulation, and runtime observability.
 
-**Impact:** System design thinking atrophies while operational knowledge grows.
+## Local development
 
-### 2. Slow Feedback Loops Kill Design Growth
-System design requires fast iteration, repeated failure, and reflection.
+Requirements:
 
-Kubernetes provides:
-- Delayed failures (minutes to hours)
-- Non-local causality (effects appear far from causes)
-- Noisy signals (hard to isolate what failed and why)
-- High setup cost per experiment
+- Node.js 22+ recommended
 
-**Impact:** Learning velocity collapses. Engineers cannot fail fast enough to develop judgment.
+Install dependencies:
 
-### 3. Platform Mastery ≠ System Design Skill
-Organizations reward:
-- Tool mastery and certifications
-- Operational familiarity and incident response
+```bash
+npm install
+```
 
-But these do not correlate with:
-- Good architecture and design judgment
-- Resilient systems and failure planning
-- Cost-efficient and well-reasoned solutions
-- Safe abstractions and clear boundaries
+Run the development server:
 
-**Impact:** Senior engineers can operate platforms but struggle to design systems. Promotions happen without architectural growth.
+```bash
+npm run dev
+```
 
-### 4. Abstraction is Inevitable — But Poorly Managed
-Platforms will be abstracted. History proves this.
+Run the quality gates:
 
-The problem is how:
-- Abstractions are ad-hoc and inconsistent
-- Guardrails are unclear or missing
-- Humans are still exposed to low-level complexity
-- Implementation details leak through
+```bash
+npm run lint
+npm run test
+npm run build
+```
 
-**Impact:** Risk increases instead of decreasing. Abstractions hide complexity rather than eliminate it.
+## Testing strategy
 
----
+The repo starts with two testing layers:
 
-## Evidence This Is Real (Not Theoretical)
+- `src/engine.test.ts`
+  Verifies pattern detection, validation rules, deployment-plan generation, and Kubernetes YAML export.
+- `src/App.test.tsx`
+  Verifies the UI renders the generated infrastructure view, updates state, and persists workspace changes.
 
-- Kubernetes outages caused by small configuration errors
-- Teams afraid to modify infrastructure
-- Over-reliance on "platform experts" as a single point of failure
-- Slow architectural evolution across organizations
-- High operational burnout and context-switching
-- Repeated mistakes across different teams and organizations
-- Skill gaps persisting despite widespread training and documentation
+This is the minimum bar required to make future expansion safe.
 
-**This is not a skills problem.** It's a learning incentive problem.
+## CI
 
----
+GitHub Actions runs on pushes to `main` and on pull requests:
 
-## What This Is NOT About
+1. `npm ci`
+2. `npm run lint`
+3. `npm run test`
+4. `npm run build`
 
-- "People don't understand Kubernetes"
-- "We need better documentation"
-- "Engineers need more training courses"
+See [`.github/workflows/ci.yml`](D:/visual_kub/.github/workflows/ci.yml).
 
----
+## Suggested next steps
 
-## What This IS About
-
-**How do we let engineers practice system design at high velocity without requiring them to master complex platform mechanics?**
-
----
-
-## The Core Insight
-
-Kubernetes solved machine orchestration. It did not solve human cognition.
-
-All systems follow patterns. Most operational detail is noise.
-
-We need systems that:
-- Let engineers choose the *pattern* they want (monolith, microservices, event-driven, hybrid)
-- Eliminate fine-grained configuration and YAML management
-- Handle the repetitive details automatically
-- Restore focus to architectural decisions, not implementation details
-
----
-
-## Why This Is Solvable Now
-
-**Pattern recognition and synthesis can now be automated.**
-
-Instead of engineers manually orchestrating thousands of configuration details:
-- The system can recognize the architectural pattern they're trying to build
-- The system can generate the operational implementation automatically
-- The system can adapt based on constraints (cost, latency, reliability)
-- The system can handle the details that change infrequently
-
-(This may use advanced techniques and tooling in parts of the implementation, but the core engine is the infrastructure abstraction itself.)
-
-**This removes the "YAML jockey" trap entirely.** Engineers describe *what* they want (a pattern, a constraint, a tradeoff), and the system implements *how* it runs.
-
-The repetitive, fine-grained details that consume 80% of cognitive bandwidth become invisible.
-
----
-
-# Vision: How We Address This
-
-## The Guiding Principle
-
-**Infrastructure shouldn't be harder to understand than a game engine.**
-
-Game engines handle complexity comparable to or greater than Kubernetes—thousands of properties, networking, physics, AI pipelines, rendering systems. Yet most creators never touch the code. They use visual graphs and property panels. Experts can write code when needed, but it's not required.
-
-Infrastructure has the same complexity. It just chose a worse interface.
-
-We're building infrastructure designed by those who understand that **complexity belongs in the system, not in the interface.**
-
----
-
-## The System We're Building
-
-### Layer 1: Visual Architecture (The Interface)
-- **Graph-based design:** Drag services, databases, queues, load balancers onto a canvas
-- **Visual relationships:** Edges show communication patterns (sync HTTP, async events, shared data)
-- **Property panels for nuance:** Memory, replicas, timeouts, cost constraints, SLOs—all tunable without code
-- **Automatic validation:** Impossible states cannot be represented
-- **Real-time preview:** See what the system will actually do
-
-### Layer 2: The System Engine (The Automation)
-- **Pattern recognition:** The system identifies what you're building (microservices, monolith, event-driven, hybrid)
-- **Automatic implementation:** Generates all required infrastructure, networking, observability, and deployment logic
-- **Constraint satisfaction:** Adapts to your requirements (cost, latency, reliability, availability zones)
-- **Smart defaults:** Most decisions are made for you—based on the pattern, not your expertise
-
-### Layer 3: Optional Code Layer (The Escape Hatch)
-- **YAML/Terraform/Infrastructure-as-Code:** Available for experts who need it
-- **Not required for most teams:** The visual system and properties handle 90% of real-world needs
-- **Graceful escape:** Power users can customize specific components without losing the abstraction
-- **Version controlled:** Changes tracked, diffs visible, rollback possible
-
----
-
-## What This Solves
-
-**Cognitive Bandwidth:** Engineers design architecture, not infrastructure plumbing
-- Focus returns to tradeoffs, resilience, cost reasoning
-- Configuration details become invisible (but auditable)
-
-**Feedback Loops:** Changes are instant, not minutes-to-hours
-- Adjust replicas, add a service, change deployment strategy—all in seconds
-- Iteration velocity increases dramatically
-
-**Skill Alignment:** System design skill ≠ Platform expertise
-- Junior engineers can build resilient systems on day one
-- Platform mastery becomes optional, not required
-
-**Abstraction Quality:** Controlled, consistent, with visible escape routes
-- Patterns are enforced (safety increases)
-- Escape hatches prevent lock-in fear
-- Most teams never need the hatch
-
----
-
-## Why This Is Different
-
-- **Not "Kubernetes for dummies."** We're not simplifying Kubernetes. We're building an abstraction layer that makes Kubernetes (or any infrastructure) an implementation detail.
-- **Not "no-code infrastructure."** We support code when needed. It's just not the default.
-- **Not "PaaS constraints."** You get the flexibility and power of Kubernetes without needing to understand its internals.
-- **Designed for architects.** Visual-first means architects can design, engineers can validate, operators can deploy. Everyone speaks the same language.
-
----
-
-## Unified Observability: From Design to Operations
-
-The visual canvas doesn't disappear after deployment. It becomes your operational dashboard.
-
-### Real-Time System Health (On One Canvas)
-Instead of jumping between dashboards and log aggregation systems, engineers see:
-- Service health status (color-coded, instant)
-- Latency metrics (per edge, per node)
-- Error rates (visual indicators)
-- Resource usage (CPU, memory, requests)
-
-All on the same canvas they used to design the system.
-
-### Instant Root Cause Analysis
-- **YAML/traditional monitoring:** Service A is slow → check 47 dashboards → correlate metrics → trace logs → 45 minutes to root cause
-- **Visual system:** Service A shows latency → trace the edges → see which downstream dependency is red → found it in 2 minutes
-
-Cascade failures are visible in real time. You watch the failure propagate through the graph instead of reconstructing it from logs.
-
-### Bottlenecks Are Obvious
-A single edge showing high latency immediately tells you:
-- This is where throughput is constrained
-- This connection needs optimization or the downstream service needs scaling
-- This is your capacity planning target
-
-No cross-referencing metrics. No correlation analysis. One visual indicator.
-
-### Cost Anomalies Jump Out
-A service node suddenly consuming 10x resources is immediately visible:
-- Is this a deployment incident?
-- Legitimate traffic spike?
-- Resource leak?
-- See it happening in real time, not in the billing report next month.
-
-### Performance Testing and Load Simulation
-- Design iteration: "What happens if we add another service here?"
-- Simulate load on the canvas
-- Watch nodes strain, connections bottleneck, failure cascade
-- Understand tradeoffs instantly
-- No separate load testing pipeline—it's part of the design workflow
-
-### Capacity Planning Becomes Visual
-Instead of spreadsheets and modeling:
-- Simulate expected Black Friday load on the canvas
-- Watch which services scale smoothly
-- See which connections become bottlenecks
-- Identify exactly where to invest in capacity
-
-### Operational Resilience Through Design Validation
-Fewer infrastructure problems happen in the first place because:
-- Invalid states are impossible to represent (can't create broken connections)
-- All required infrastructure is auto-generated based on the pattern you chose
-- Relationships are explicit and validated together
-- Configuration drift is visible (the graph shows what should be running, deployment shows what is)
-
-### Incident Response Speed
-- **Traditional:** Page fires → SSH to servers → grep logs → correlate metrics → find root cause → 30+ minutes to understand, 60+ to fix
-- **Visual:** Page fires → look at canvas → see exactly what failed and why → 5 minutes to understand, 10 to fix
-
-The system's state is always visible. Incidents are not mysteries—they're stories the graph tells you.
-
-### Training and Onboarding
-New engineer joins:
-- "Here's the system architecture"
-- Watches it live, under realistic load
-- Understands relationships, bottlenecks, and behavior in real time
-- Can diagnose issues on day one because the system is transparent
-
-Instead of weeks piecing together YAML files and metrics, they understand the system visually in hours.
-
----
-
-## The Operational Impact
-
-- **MTTR (Mean Time To Recovery):** 30+ minutes → 5-10 minutes
-- **Incident detection:** After the fact → in progress (you see problems forming)
-- **Onboarding time:** 3 months → 1 week
-- **Configuration errors:** Common → virtually eliminated
-- **Operational confidence:** "Hope this doesn't break" → "I can see exactly what will happen"
-
----
-
-## Next Steps
-
-- Define target personas and their pain points
-- Write "Why Now" (competitive, technical, organizational reasons)
-- Define success metrics (what changes when this is solved)
-- Outline the solution architecture (what we're building, not building)
+- Replace the fixed SVG layout with true drag-and-drop graph editing
+- Persist architecture models locally or in a backend
+- Add topology templates for common patterns
+- Generate export artifacts for Kubernetes or Terraform
+- Introduce runtime simulation and observability overlays
