@@ -1,15 +1,28 @@
-export type NodeType = 'ingress' | 'frontend' | 'gateway' | 'service' | 'worker' | 'database' | 'cache' | 'queue';
+export type NodeType = 'ingress' | 'frontend' | 'gateway' | 'service' | 'worker' | 'database' | 'cache' | 'queue' | 'job' | 'cronjob';
 export type EdgeType = 'http' | 'async' | 'data';
 export type PatternType = 'monolith' | 'microservices' | 'event-driven' | 'hybrid';
 export type CloudProvider = 'aws' | 'gcp' | 'azure' | 'generic';
 export type EnvironmentName = 'dev' | 'stage' | 'prod';
+export type WorkloadKind = 'Deployment' | 'StatefulSet' | 'Job' | 'CronJob';
+export type RestartPolicy = 'Always' | 'OnFailure' | 'Never';
+export type StorageAccessMode = 'ReadWriteOnce' | 'ReadOnlyMany' | 'ReadWriteMany' | 'ReadWriteOncePod';
+export type VolumeMode = 'Filesystem' | 'Block';
+export type StatefulStorageRetention = 'Retain' | 'Delete';
+export type ServiceExposure = 'internal' | 'external';
+export type LoadBalancerScope = 'public' | 'private';
+export type ExternalTrafficPolicy = 'Cluster' | 'Local';
+export type NetworkPolicyIntent = 'allow' | 'deny';
+export type ProbeType = 'http' | 'tcp' | 'exec';
 
 export interface ProbeConfig {
   enabled: boolean;
+  type: ProbeType;
   path: string;
   port: number;
+  command: string;
   initialDelaySeconds: number;
   periodSeconds: number;
+  failureThreshold: number;
 }
 
 export interface ResourceConfig {
@@ -24,6 +37,18 @@ export interface AutoscalingConfig {
   minReplicas: number;
   maxReplicas: number;
   targetCPUUtilizationPercentage: number;
+}
+
+export interface WorkloadConfig {
+  kind: WorkloadKind;
+  schedule: string;
+  completions: number;
+  parallelism: number;
+  backoffLimit: number;
+  restartPolicy: RestartPolicy;
+  command: string[];
+  args: string[];
+  terminationGracePeriodSeconds: number;
 }
 
 export interface EnvironmentVariable {
@@ -50,12 +75,21 @@ export interface StorageConfig {
   enabled: boolean;
   size: string;
   storageClassName: string;
+  accessMode: StorageAccessMode;
+  volumeMode: VolumeMode;
   mountPath: string;
+  retainOnDelete: StatefulStorageRetention;
+  retainOnScaleDown: StatefulStorageRetention;
+  backupEnabled: boolean;
+  backupSchedule: string;
 }
 
 export interface ServiceConfig {
   type: 'ClusterIP' | 'NodePort' | 'LoadBalancer';
   port: number;
+  exposure: ServiceExposure;
+  loadBalancerScope: LoadBalancerScope;
+  externalTrafficPolicy: ExternalTrafficPolicy;
 }
 
 export interface IngressConfig {
@@ -64,7 +98,18 @@ export interface IngressConfig {
   path: string;
   tlsEnabled: boolean;
   tlsSecretName: string;
+  tlsIssuer: string;
   ingressClassName: string;
+  exposure: ServiceExposure;
+  loadBalancerScope: LoadBalancerScope;
+}
+
+export interface SecurityConfig {
+  runAsNonRoot: boolean;
+  runAsUser: number;
+  readOnlyRootFilesystem: boolean;
+  allowPrivilegeEscalation: boolean;
+  seccompProfile: 'RuntimeDefault' | 'Localhost' | 'Unconfined';
 }
 
 export interface NodeEnvironmentOverride {
@@ -92,10 +137,14 @@ export interface ArchitectureNode {
   resources: ResourceConfig;
   readinessProbe: ProbeConfig;
   livenessProbe: ProbeConfig;
+  startupProbe: ProbeConfig;
   autoscaling: AutoscalingConfig;
+  workload: WorkloadConfig;
   storage: StorageConfig;
   service: ServiceConfig;
   serviceAccountName: string;
+  imagePullSecrets: string[];
+  security: SecurityConfig;
   ingress: IngressConfig;
   environmentOverrides?: Partial<Record<EnvironmentName, NodeEnvironmentOverride>>;
 }
@@ -106,6 +155,7 @@ export interface ArchitectureEdge {
   to: string;
   type: EdgeType;
   latencyBudgetMs: number;
+  networkPolicy: NetworkPolicyIntent;
 }
 
 export interface ArchitectureModel {

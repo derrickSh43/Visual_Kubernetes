@@ -8,80 +8,80 @@ Make the graph produce deployment configuration that is credible, modular, and a
 
 ## Ordered implementation list
 
-1. Environment overlays
+1. Environment overlays [done]
 Add `dev`, `stage`, and `prod` environments with override support for replicas, image tags, domains, resources, and autoscaling so the model matches real deployment workflows.
 
-2. Edge-driven config wiring
+2. Edge-driven config wiring [done]
 Make graph connections drive generated configuration directly:
 - `http` edges should define service dependency and routing relationships.
 - `async` edges should define queue dependency and broker connection settings.
 - `data` edges should define database/cache connection settings.
 - inspector and export output should stay in sync with the graph.
 
-3. Secrets and config model cleanup
+3. Secrets and config model cleanup [done]
 Separate plain config from secrets more realistically:
 - support `ConfigMap` values
 - support inline secrets for MVP
 - support secret references/placeholders for later external secret systems
 - avoid treating every secret as raw text only
 
-4. Provider-aware defaults
+4. Provider-aware defaults [done]
 Make `aws`, `gcp`, `azure`, and `generic` materially affect defaults and exports:
 - ingress/load balancer annotations
 - storage class defaults
 - service exposure defaults
 - generated README guidance
 
-5. Security baseline
+5. Security baseline [done]
 Add the minimum security settings needed for credible exports:
 - RBAC placeholders
 - security context defaults
 - image pull secret support
 - graph-aware network policy generation
 
-6. Workload type specialization
+6. Workload type specialization [done]
 Stop treating all compute nodes as the same deployment shape:
 - `service` and `frontend` -> deployment defaults
 - `worker` -> background workload defaults
 - `database`, `cache`, `queue` -> stronger stateful defaults
 - add `job` and `cronjob` support if needed for workload coverage
 
-7. Storage model depth
+7. Storage model depth [done]
 Expand persistent storage beyond a single size field:
 - access mode
 - storage class choice
 - storage behavior by workload type
 - better defaults for databases, caches, and queues
 
-8. Networking depth
+8. Networking depth [done]
 Strengthen runtime traffic and exposure modeling:
 - internal vs external service exposure
 - ingress class and TLS behavior
 - public/private load balancer intent
 - service-to-service policy intent
 
-9. Runtime behavior depth
+9. Runtime behavior depth [done]
 Expand workload execution settings where real deployments need them:
 - startup probes
 - command and args
 - restart behavior where relevant
 - stronger health-check modeling per workload type
 
-10. Export structure hardening
+10. Export structure hardening [done]
 Improve output quality and project structure:
 - keep generated files modular
 - group output by environment and namespace
 - produce cleaner package layout for download bundles
 - make YAML and Terraform exports stay aligned from the same internal model
 
-11. Validation hardening
+11. Validation hardening [done]
 Catch incomplete or risky models before export:
 - missing environment overrides
 - invalid dependency patterns
 - unresolved secret/config references
 - namespace, ingress, storage, and scaling issues
 
-12. UX pass for config-builder workflows
+12. UX pass for config-builder workflows [done]
 Refine the editor around the deployment model instead of around presentation:
 - better edge feedback
 - environment switching in the top bar

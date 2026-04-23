@@ -14,6 +14,8 @@ export const availableNodeTypes: Array<{ type: NodeType; label: string; descript
   { type: 'gateway', label: 'Gateway', description: 'API gateway or edge service' },
   { type: 'service', label: 'Service', description: 'Core application workload' },
   { type: 'worker', label: 'Worker', description: 'Background processor or job consumer' },
+  { type: 'job', label: 'Job', description: 'One-time batch task' },
+  { type: 'cronjob', label: 'CronJob', description: 'Scheduled batch task' },
   { type: 'queue', label: 'Queue', description: 'Message broker or stream entry' },
   { type: 'cache', label: 'Cache', description: 'Low-latency in-memory store' },
   { type: 'database', label: 'Database', description: 'Persistent stateful storage' },
@@ -22,13 +24,84 @@ export const availableNodeTypes: Array<{ type: NodeType; label: string; descript
 
 export const supportedEnvironments: EnvironmentName[] = ['dev', 'stage', 'prod'];
 
-function baseProbe(path: string, port: number) {
+function baseProbe(path: string, port: number, type: 'http' | 'tcp' | 'exec' = 'http') {
   return {
     enabled: true,
+    type,
     path,
     port,
+    command: '',
     initialDelaySeconds: 10,
     periodSeconds: 10,
+    failureThreshold: 3,
+  };
+}
+
+function disabledProbe(path: string, port: number, type: 'http' | 'tcp' | 'exec' = 'http') {
+  return {
+    ...baseProbe(path, port, type),
+    enabled: false,
+    initialDelaySeconds: 20,
+    failureThreshold: 30,
+  };
+}
+
+function defaultProbeType(type: NodeType) {
+  return type === 'database' || type === 'queue' || type === 'cache' ? 'tcp' as const : 'http' as const;
+}
+
+function defaultStartupProbe(type: NodeType, port: number) {
+  if (type === 'job' || type === 'cronjob') {
+    return disabledProbe('/ready', port);
+  }
+
+  const probeType = defaultProbeType(type);
+  return {
+    ...baseProbe(probeType === 'tcp' ? '' : '/ready', port, probeType),
+    initialDelaySeconds: type === 'database' || type === 'queue' ? 20 : 10,
+    periodSeconds: 5,
+    failureThreshold: type === 'database' || type === 'queue' ? 30 : 12,
+  };
+}
+
+function defaultRuntime(type: NodeType) {
+  return {
+    command: [] as string[],
+    args: [] as string[],
+    terminationGracePeriodSeconds: type === 'database' || type === 'queue' ? 60 : type === 'job' || type === 'cronjob' ? 30 : 45,
+  };
+}
+
+function defaultWorkloadKind(type: NodeType) {
+  if (type === 'database' || type === 'queue' || type === 'cache') {
+    return 'StatefulSet' as const;
+  }
+  if (type === 'job') {
+    return 'Job' as const;
+  }
+  if (type === 'cronjob') {
+    return 'CronJob' as const;
+  }
+  return 'Deployment' as const;
+}
+
+function storageDefaults(type: NodeType) {
+  return {
+    enabled: type === 'database' || type === 'queue' || type === 'cache',
+    size: type === 'database' ? '20Gi' : type === 'queue' ? '8Gi' : type === 'cache' ? '4Gi' : '5Gi',
+    storageClassName: 'standard',
+    accessMode: 'ReadWriteOnce' as const,
+    volumeMode: 'Filesystem' as const,
+    mountPath:
+      type === 'database'
+        ? '/var/lib/postgresql/data'
+        : type === 'queue'
+          ? '/var/lib/rabbitmq'
+          : '/data',
+    retainOnDelete: type === 'database' || type === 'queue' ? 'Retain' as const : 'Delete' as const,
+    retainOnScaleDown: type === 'database' || type === 'queue' ? 'Retain' as const : 'Delete' as const,
+    backupEnabled: type === 'database' || type === 'queue',
+    backupSchedule: '0 2 * * *',
   };
 }
 
@@ -37,14 +110,13 @@ function createNode(id: string, name: string, type: NodeType, overrides: Partial
   const defaultPort =
     type === 'database' ? 5432 : type === 'queue' ? 5672 : type === 'cache' ? 6379 : type === 'ingress' ? 80 : 8080;
   const defaultServicePort = type === 'database' ? 5432 : type === 'queue' ? 5672 : type === 'cache' ? 6379 : 80;
-  const defaultStorageEnabled = type === 'database' || type === 'queue' || type === 'cache';
 
   return {
     id,
     name,
     type,
     namespace: defaultNamespace,
-    replicas: type === 'database' ? 1 : 2,
+    replicas: type === 'database' || type === 'queue' || type === 'cache' || type === 'job' || type === 'cronjob' ? 1 : 2,
     cpu: type === 'database' ? 2 : 1,
     memory: type === 'database' ? 8 : 2,
     sla: type === 'database' ? 'critical' : 'standard',
@@ -61,6 +133,10 @@ function createNode(id: string, name: string, type: NodeType, overrides: Partial
                 ? 'ghcr.io/visual-kubernetes/gateway'
                 : type === 'worker'
                   ? 'ghcr.io/visual-kubernetes/worker'
+                  : type === 'job'
+                    ? 'ghcr.io/visual-kubernetes/job'
+                    : type === 'cronjob'
+                      ? 'ghcr.io/visual-kubernetes/cronjob'
                   : type === 'ingress'
                     ? 'nginx'
                     : 'ghcr.io/visual-kubernetes/service',
@@ -83,37 +159,51 @@ function createNode(id: string, name: string, type: NodeType, overrides: Partial
       limitsCpu: type === 'database' ? '2000m' : '1000m',
       limitsMemory: type === 'database' ? '4Gi' : '1Gi',
     },
-    readinessProbe: baseProbe('/ready', defaultPort),
-    livenessProbe: baseProbe('/health', defaultPort),
+    readinessProbe: baseProbe('/ready', defaultPort, defaultProbeType(type)),
+    livenessProbe: baseProbe('/health', defaultPort, defaultProbeType(type)),
+    startupProbe: defaultStartupProbe(type, defaultPort),
     autoscaling: {
-      enabled: type === 'service' || type === 'frontend' || type === 'gateway' || type === 'worker',
+      enabled: type === 'service' || type === 'frontend' || type === 'gateway',
       minReplicas: 2,
       maxReplicas: 6,
       targetCPUUtilizationPercentage: 70,
     },
-    storage: {
-      enabled: defaultStorageEnabled,
-      size: type === 'database' ? '20Gi' : type === 'queue' ? '8Gi' : type === 'cache' ? '4Gi' : '5Gi',
-      storageClassName: 'standard',
-      mountPath:
-        type === 'database'
-          ? '/var/lib/postgresql/data'
-          : type === 'queue'
-            ? '/var/lib/rabbitmq'
-            : '/data',
+    workload: {
+      kind: defaultWorkloadKind(type),
+      schedule: '*/15 * * * *',
+      completions: 1,
+      parallelism: 1,
+      backoffLimit: 3,
+      restartPolicy: type === 'job' || type === 'cronjob' ? 'OnFailure' : 'Always',
+      ...defaultRuntime(type),
     },
+    storage: storageDefaults(type),
     service: {
       type: 'ClusterIP',
       port: defaultServicePort,
+      exposure: type === 'ingress' ? 'external' : 'internal',
+      loadBalancerScope: 'public',
+      externalTrafficPolicy: 'Cluster',
     },
     serviceAccountName: `${id}-sa`,
+    imagePullSecrets: [],
+    security: {
+      runAsNonRoot: type !== 'database' && type !== 'queue',
+      runAsUser: type === 'database' ? 999 : type === 'queue' ? 999 : 1000,
+      readOnlyRootFilesystem: type !== 'database' && type !== 'queue' && type !== 'cache',
+      allowPrivilegeEscalation: false,
+      seccompProfile: 'RuntimeDefault',
+    },
     ingress: {
       enabled: type === 'ingress',
       host: `${id}.example.internal`,
       path: '/',
       tlsEnabled: false,
       tlsSecretName: `${id}-tls`,
+      tlsIssuer: '',
       ingressClassName: 'nginx',
+      exposure: type === 'ingress' ? 'external' : 'internal',
+      loadBalancerScope: 'public',
     },
     environmentOverrides: {},
     ...overrides,
@@ -126,14 +216,17 @@ function envOverride(overrides: Partial<Record<EnvironmentName, NodeEnvironmentO
 
 export const starterNodes: ArchitectureNode[] = [
   createNode('ingress-web', 'Public API', 'ingress', {
-    service: { type: 'LoadBalancer', port: 80 },
+    service: { type: 'LoadBalancer', port: 80, exposure: 'external', loadBalancerScope: 'public', externalTrafficPolicy: 'Cluster' },
     ingress: {
       enabled: true,
       host: 'api.checkout.internal',
       path: '/',
       tlsEnabled: true,
       tlsSecretName: 'checkout-api-tls',
+      tlsIssuer: 'letsencrypt-prod',
       ingressClassName: 'nginx',
+      exposure: 'external',
+      loadBalancerScope: 'public',
     },
     environmentOverrides: envOverride({
       dev: {
@@ -158,6 +251,7 @@ export const starterNodes: ArchitectureNode[] = [
     image: 'ghcr.io/visual-kubernetes/checkout-service',
     tag: '1.0.0',
     containerPort: 8080,
+    imagePullSecrets: ['ghcr-pull-secret'],
     env: [
       { key: 'SPRING_PROFILES_ACTIVE', value: 'prod' },
       { key: 'DATABASE_HOST', value: 'orders-db.data' },
@@ -195,6 +289,7 @@ export const starterNodes: ArchitectureNode[] = [
     namespace: 'inventory',
     image: 'ghcr.io/visual-kubernetes/inventory-service',
     tag: '1.0.0',
+    imagePullSecrets: ['ghcr-pull-secret'],
     env: [{ key: 'QUEUE_HOST', value: 'domain-events.platform' }],
     secretEnv: [{ source: 'existingSecret', key: 'QUEUE_PASSWORD', secretName: 'inventory-runtime', secretKey: 'queue-password' }],
     environmentOverrides: envOverride({
@@ -218,7 +313,7 @@ export const starterNodes: ArchitectureNode[] = [
     image: 'rabbitmq',
     tag: '3-management',
     containerPort: 5672,
-    service: { type: 'ClusterIP', port: 5672 },
+    service: { type: 'ClusterIP', port: 5672, exposure: 'internal', loadBalancerScope: 'private', externalTrafficPolicy: 'Cluster' },
     readinessProbe: baseProbe('/', 15672),
     livenessProbe: baseProbe('/', 15672),
     autoscaling: {
@@ -231,7 +326,13 @@ export const starterNodes: ArchitectureNode[] = [
       enabled: true,
       size: '8Gi',
       storageClassName: 'standard',
+      accessMode: 'ReadWriteOnce',
+      volumeMode: 'Filesystem',
       mountPath: '/var/lib/rabbitmq',
+      retainOnDelete: 'Retain',
+      retainOnScaleDown: 'Retain',
+      backupEnabled: true,
+      backupSchedule: '0 2 * * *',
     },
     secretEnv: [{ source: 'inline', key: 'RABBITMQ_DEFAULT_PASS', value: 'change-me' }],
     environmentOverrides: envOverride({
@@ -252,7 +353,7 @@ export const starterNodes: ArchitectureNode[] = [
     image: 'postgres',
     tag: '16',
     containerPort: 5432,
-    service: { type: 'ClusterIP', port: 5432 },
+    service: { type: 'ClusterIP', port: 5432, exposure: 'internal', loadBalancerScope: 'private', externalTrafficPolicy: 'Cluster' },
     env: [{ key: 'POSTGRES_DB', value: 'orders' }],
     secretEnv: [
       { source: 'inline', key: 'POSTGRES_USER', value: 'orders_app' },
@@ -260,17 +361,23 @@ export const starterNodes: ArchitectureNode[] = [
     ],
     readinessProbe: {
       enabled: true,
+      type: 'tcp',
       path: '/ready',
       port: 5432,
+      command: '',
       initialDelaySeconds: 20,
       periodSeconds: 10,
+      failureThreshold: 3,
     },
     livenessProbe: {
       enabled: true,
+      type: 'tcp',
       path: '/live',
       port: 5432,
+      command: '',
       initialDelaySeconds: 30,
       periodSeconds: 15,
+      failureThreshold: 3,
     },
     autoscaling: {
       enabled: false,
@@ -282,7 +389,13 @@ export const starterNodes: ArchitectureNode[] = [
       enabled: true,
       size: '50Gi',
       storageClassName: 'premium-rwo',
+      accessMode: 'ReadWriteOnce',
+      volumeMode: 'Filesystem',
       mountPath: '/var/lib/postgresql/data',
+      retainOnDelete: 'Retain',
+      retainOnScaleDown: 'Retain',
+      backupEnabled: true,
+      backupSchedule: '0 1 * * *',
     },
     environmentOverrides: envOverride({
       dev: {
@@ -307,10 +420,10 @@ export const starterNodes: ArchitectureNode[] = [
 ];
 
 export const starterEdges: ArchitectureEdge[] = [
-  { id: 'e1', from: 'ingress-web', to: 'service-checkout', type: 'http', latencyBudgetMs: 150 },
-  { id: 'e2', from: 'service-checkout', to: 'service-inventory', type: 'http', latencyBudgetMs: 200 },
-  { id: 'e3', from: 'service-checkout', to: 'queue-events', type: 'async', latencyBudgetMs: 500 },
-  { id: 'e4', from: 'service-checkout', to: 'db-orders', type: 'data', latencyBudgetMs: 40 },
+  { id: 'e1', from: 'ingress-web', to: 'service-checkout', type: 'http', latencyBudgetMs: 150, networkPolicy: 'allow' },
+  { id: 'e2', from: 'service-checkout', to: 'service-inventory', type: 'http', latencyBudgetMs: 200, networkPolicy: 'allow' },
+  { id: 'e3', from: 'service-checkout', to: 'queue-events', type: 'async', latencyBudgetMs: 500, networkPolicy: 'allow' },
+  { id: 'e4', from: 'service-checkout', to: 'db-orders', type: 'data', latencyBudgetMs: 40, networkPolicy: 'allow' },
 ];
 
 export const starterArchitecture: ArchitectureModel = {
@@ -348,6 +461,10 @@ export function createNodeTemplate(type: NodeType, defaultNamespace = 'visual-ku
           ? 'Service'
           : type === 'worker'
             ? 'Worker'
+            : type === 'job'
+              ? 'Job'
+              : type === 'cronjob'
+                ? 'CronJob'
             : type === 'database'
               ? 'Database'
               : type === 'cache'
@@ -359,11 +476,11 @@ export function createNodeTemplate(type: NodeType, defaultNamespace = 'visual-ku
     namespace: defaultNamespace,
     environmentOverrides: {
       dev: {
-        replicas: type === 'database' ? 1 : 1,
+        replicas: 1,
         tag: type === 'ingress' ? 'dev' : 'latest-dev',
       },
       stage: {
-        replicas: type === 'database' ? 1 : 2,
+        replicas: type === 'database' || type === 'queue' || type === 'cache' || type === 'job' || type === 'cronjob' ? 1 : 2,
         tag: type === 'ingress' ? 'stage' : 'latest-rc',
       },
     },

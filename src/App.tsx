@@ -10,12 +10,12 @@ import {
   generateProjectFiles,
   generateTerraform,
   getResolvedModel,
+  getProviderProfile,
   inferEdgeType,
-  resolveNodeForEnvironment,
   validateArchitecture,
 } from './engine';
 import { loadWorkspace, saveWorkspace } from './storage';
-import type { ArchitectureEdge, ArchitectureNode, EdgeType, EnvironmentName, NodeType, WorkspaceState } from './types';
+import type { ArchitectureEdge, ArchitectureNode, EdgeType, EnvironmentName, NetworkPolicyIntent, NodeType, WorkspaceState } from './types';
 
 const nodeColors: Record<NodeType, string> = {
   ingress: '#4dabf7',
@@ -26,6 +26,8 @@ const nodeColors: Record<NodeType, string> = {
   database: '#845ef7',
   cache: '#51cf66',
   queue: '#12b886',
+  job: '#ffa94d',
+  cronjob: '#ff922b',
 };
 
 const canvasBounds = {
@@ -40,6 +42,23 @@ const nodePortInset = 12;
 const editorMenus = ['File', 'Edit', 'Asset', 'View', 'Graph', 'Tools', 'Help'];
 const actionBarItems = ['Compile', 'Save', 'Browse', 'Diff', 'Find', 'Blueprint Settings'];
 const workbenchTabs = ['Viewport', 'Cluster Graph', 'Runtime Model'];
+
+const nodeBehaviorCopy: Record<NodeType, string> = {
+  ingress: 'Ingress entrypoint: routes external traffic to frontend, gateway, or service nodes in the same namespace.',
+  frontend: 'Frontend deployment: emits Service, optional Ingress, probes, HPA, and dependency environment wiring.',
+  gateway: 'Gateway deployment: emits Service, optional Ingress, probes, HPA, and HTTP routing dependencies.',
+  service: 'Service deployment: emits Service, probes, HPA, config, secrets, and graph-derived dependency variables.',
+  worker: 'Worker deployment: does not emit a Service; connects out to queues, data stores, and APIs.',
+  database: 'Stateful database: emits StatefulSet, headless-style storage claims, Service, retention, and backup annotations.',
+  cache: 'Stateful cache: emits StatefulSet, Service, storage if enabled, and data dependency endpoints.',
+  queue: 'Stateful queue: emits StatefulSet, Service, durable storage, and async dependency endpoints.',
+  job: 'One-time batch workload: emits Job only; it can consume dependencies but cannot receive runtime traffic.',
+  cronjob: 'Scheduled batch workload: emits CronJob only; it can consume dependencies but cannot receive runtime traffic.',
+};
+
+function environmentLabel(environment: EnvironmentName) {
+  return environment === 'prod' ? 'Prod' : environment === 'stage' ? 'Stage' : 'Dev';
+}
 
 function nextLayoutPosition(count: number) {
   const column = count % 4;
@@ -83,6 +102,13 @@ function parseSecretEntries(input: string): ArchitectureNode['secretEnv'] {
     });
 }
 
+function parseListInput(input: string) {
+  return input
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
 export function App() {
   const [workspace, setWorkspace] = useState<WorkspaceState>(() => loadWorkspace());
   const [selectedNodeId, setSelectedNodeId] = useState(workspace.model.nodes[0]?.id ?? '');
@@ -99,11 +125,12 @@ export function App() {
     tone: 'neutral',
     text: 'Select a source and target, or use Connect on stage from the selected node.',
   });
-  const [edgeDraft, setEdgeDraft] = useState<{ from: string; to: string; type: EdgeType; latencyBudgetMs: number }>({
+  const [edgeDraft, setEdgeDraft] = useState<{ from: string; to: string; type: EdgeType; latencyBudgetMs: number; networkPolicy: NetworkPolicyIntent }>({
     from: workspace.model.nodes[0]?.id ?? '',
     to: workspace.model.nodes[1]?.id ?? '',
     type: 'http',
     latencyBudgetMs: 100,
+    networkPolicy: 'allow',
   });
 
   const dragRef = useRef<{ nodeId: string; offsetX: number; offsetY: number } | null>(null);
@@ -120,8 +147,21 @@ export function App() {
   const yamlOutput = useMemo(() => generateKubernetesYaml(model), [model]);
   const terraformOutput = useMemo(() => generateTerraform(model), [model]);
   const selectedNode = model.nodes.find((node) => node.id === selectedNodeId) ?? model.nodes[0];
-  const selectedNodeResolved = selectedNode ? resolveNodeForEnvironment(selectedNode, model.activeEnvironment) : undefined;
+  const selectedNodeResolved = selectedNode ? resolvedModel.nodes.find((node) => node.id === selectedNode.id) : undefined;
   const derivedSelectedNodeEnv = useMemo(() => (selectedNode ? getDerivedEnvironmentVariables(model, selectedNode.id) : []), [model, selectedNode]);
+  const providerProfile = useMemo(() => getProviderProfile(model.provider), [model.provider]);
+  const validEdgeTargets = useMemo(() => {
+    const fromNode = model.nodes.find((node) => node.id === edgeDraft.from);
+    if (!fromNode) {
+      return [];
+    }
+
+    return model.nodes
+      .filter((node) => node.id !== fromNode.id)
+      .map((node) => ({ node, decision: canConnectNodes(fromNode, node), inferredType: inferEdgeType(fromNode, node) }))
+      .filter((entry) => entry.decision.allowed);
+  }, [edgeDraft.from, model.nodes]);
+  const selectedNodeBehavior = selectedNode ? nodeBehaviorCopy[selectedNode.type] : '';
 
   useEffect(() => {
     saveWorkspace(workspace);
@@ -344,6 +384,7 @@ export function App() {
         to: toId,
         type,
         latencyBudgetMs: edgeDraft.latencyBudgetMs,
+        networkPolicy: edgeDraft.networkPolicy,
       };
 
       outcome = {
@@ -428,6 +469,77 @@ export function App() {
       to: starterWorkspace.model.nodes[1]?.id ?? '',
       type: 'http',
       latencyBudgetMs: 100,
+      networkPolicy: 'allow',
+    });
+  }
+
+  function applyProdReadyProfile() {
+    if (!selectedNode) {
+      return;
+    }
+
+    updateNode({
+      replicas: Math.max(selectedNode.replicas, 3),
+      tag: selectedNode.tag === 'latest' ? '1.0.0' : selectedNode.tag,
+      resources: {
+        ...selectedNode.resources,
+        requestsCpu: selectedNode.resources.requestsCpu || '250m',
+        requestsMemory: selectedNode.resources.requestsMemory || '256Mi',
+        limitsCpu: selectedNode.resources.limitsCpu || '1000m',
+        limitsMemory: selectedNode.resources.limitsMemory || '1Gi',
+      },
+      autoscaling:
+        selectedNode.workload.kind === 'Deployment'
+          ? {
+              ...selectedNode.autoscaling,
+              enabled: true,
+              minReplicas: Math.max(selectedNode.autoscaling.minReplicas, 2),
+              maxReplicas: Math.max(selectedNode.autoscaling.maxReplicas, 6),
+            }
+          : selectedNode.autoscaling,
+      environmentOverrides: {
+        ...selectedNode.environmentOverrides,
+        prod: {
+          ...selectedNode.environmentOverrides?.prod,
+          replicas: Math.max(selectedNode.environmentOverrides?.prod?.replicas ?? selectedNode.replicas, 3),
+          tag: selectedNode.environmentOverrides?.prod?.tag ?? (selectedNode.tag === 'latest' ? '1.0.0' : selectedNode.tag),
+        },
+      },
+    });
+  }
+
+  function applyPublicTlsIngress() {
+    if (!selectedNode) {
+      return;
+    }
+
+    updateNode({
+      ingress: {
+        ...selectedNode.ingress,
+        enabled: true,
+        exposure: 'external',
+        loadBalancerScope: 'public',
+        tlsEnabled: true,
+        tlsIssuer: selectedNode.ingress.tlsIssuer || 'letsencrypt-prod',
+        tlsSecretName: selectedNode.ingress.tlsSecretName || `${selectedNode.id}-tls`,
+      },
+    });
+  }
+
+  function applyDurableStorageProfile() {
+    if (!selectedNode) {
+      return;
+    }
+
+    updateNode({
+      storage: {
+        ...selectedNode.storage,
+        enabled: true,
+        retainOnDelete: 'Retain',
+        retainOnScaleDown: 'Retain',
+        backupEnabled: true,
+        size: selectedNode.type === 'database' && parseInt(selectedNode.storage.size, 10) < 20 ? '20Gi' : selectedNode.storage.size,
+      },
     });
   }
 
@@ -510,6 +622,19 @@ export function App() {
               </button>
             ))}
           </div>
+          <div className="editor-action-group environment-switcher" aria-label="Environment switcher">
+            {supportedEnvironments.map((environment) => (
+              <button
+                key={environment}
+                type="button"
+                className={model.activeEnvironment === environment ? 'chrome-button active' : 'chrome-button'}
+                onClick={() => updateModel({ activeEnvironment: environment })}
+                aria-pressed={model.activeEnvironment === environment}
+              >
+                {environmentLabel(environment)}
+              </button>
+            ))}
+          </div>
           <div className="editor-action-group">
             <button type="button" className="chrome-button active">
               Cluster Defaults
@@ -581,6 +706,9 @@ export function App() {
                     ))}
                   </select>
                 </label>
+                <div className="node-type-description span-two">
+                  {providerProfile.storageClassName} storage | {providerProfile.ingressClassName} ingress | {providerProfile.loadBalancerMode}
+                </div>
               </div>
             </div>
 
@@ -600,6 +728,10 @@ export function App() {
                 <div className="node-type-description span-two">
                   {availableNodeTypes.find((nodeType) => nodeType.type === newNodeType)?.description}
                 </div>
+                <div className="behavior-card span-two">
+                  <strong>Behavior</strong>
+                  <span>{nodeBehaviorCopy[newNodeType]}</span>
+                </div>
               </div>
               <button type="button" className="primary-button wide" onClick={() => addNode(newNodeType)}>
                 Add node
@@ -611,7 +743,26 @@ export function App() {
               <div className="field-grid">
                 <label>
                   From
-                  <select value={edgeDraft.from} onChange={(event) => setEdgeDraft((current) => ({ ...current, from: event.target.value }))}>
+                  <select
+                    value={edgeDraft.from}
+                    onChange={(event) => {
+                      const nextFromId = event.target.value;
+                      const nextFrom = model.nodes.find((node) => node.id === nextFromId);
+                      const currentTo = model.nodes.find((node) => node.id === edgeDraft.to);
+                      const canKeepTarget = nextFrom && currentTo ? canConnectNodes(nextFrom, currentTo).allowed : false;
+                      const fallbackTarget = nextFrom
+                        ? model.nodes.find((node) => node.id !== nextFrom.id && canConnectNodes(nextFrom, node).allowed)
+                        : undefined;
+                      const nextTo = canKeepTarget ? edgeDraft.to : fallbackTarget?.id ?? edgeDraft.to;
+                      const nextToNode = model.nodes.find((node) => node.id === nextTo);
+                      setEdgeDraft((current) => ({
+                        ...current,
+                        from: nextFromId,
+                        to: nextTo,
+                        type: nextFrom && nextToNode ? inferEdgeType(nextFrom, nextToNode) : current.type,
+                      }));
+                    }}
+                  >
                     {model.nodes.map((node) => (
                       <option key={node.id} value={node.id}>
                         {node.name}
@@ -621,7 +772,19 @@ export function App() {
                 </label>
                 <label>
                   To
-                  <select value={edgeDraft.to} onChange={(event) => setEdgeDraft((current) => ({ ...current, to: event.target.value }))}>
+                  <select
+                    value={edgeDraft.to}
+                    onChange={(event) => {
+                      const nextToId = event.target.value;
+                      const fromNode = model.nodes.find((node) => node.id === edgeDraft.from);
+                      const toNode = model.nodes.find((node) => node.id === nextToId);
+                      setEdgeDraft((current) => ({
+                        ...current,
+                        to: nextToId,
+                        type: fromNode && toNode ? inferEdgeType(fromNode, toNode) : current.type,
+                      }));
+                    }}
+                  >
                     {model.nodes.map((node) => (
                       <option key={node.id} value={node.id}>
                         {node.name}
@@ -649,6 +812,40 @@ export function App() {
                     onChange={(event) => setEdgeDraft((current) => ({ ...current, latencyBudgetMs: Number(event.target.value) }))}
                   />
                 </label>
+                <label className="span-two">
+                  Network policy
+                  <select
+                    value={edgeDraft.networkPolicy}
+                    onChange={(event) => setEdgeDraft((current) => ({ ...current, networkPolicy: event.target.value as NetworkPolicyIntent }))}
+                  >
+                    <option value="allow">Allow traffic and generate policy</option>
+                    <option value="deny">Document dependency but deny traffic</option>
+                  </select>
+                </label>
+              </div>
+              <div className="edge-guidance">
+                <div className="edge-guidance-title">Valid targets from this source</div>
+                {validEdgeTargets.length > 0 ? (
+                  validEdgeTargets.slice(0, 5).map(({ node, inferredType }) => (
+                    <button
+                      key={node.id}
+                      type="button"
+                      className="edge-target-button"
+                      onClick={() =>
+                        setEdgeDraft((current) => ({
+                          ...current,
+                          to: node.id,
+                          type: inferredType,
+                        }))
+                      }
+                    >
+                      <span>{node.name}</span>
+                      <strong>{inferredType}</strong>
+                    </button>
+                  ))
+                ) : (
+                  <div className="node-type-description">No valid targets for the selected source.</div>
+                )}
               </div>
               <div className={`status-chip ${connectionMessage.tone}`}>{connectionMessage.text}</div>
               <button type="button" className="primary-button wide" onClick={() => addEdge()}>
@@ -684,6 +881,10 @@ export function App() {
             <span className="toolbar-chip">{deploymentPlan.nodeCount} nodes</span>
             <span className="toolbar-chip">{model.activeEnvironment}</span>
             <span className="toolbar-chip">{model.provider}</span>
+            <span className={validationIssues.some((issue) => issue.level === 'error') ? 'toolbar-chip error' : 'toolbar-chip'}>
+              {validationIssues.filter((issue) => issue.level === 'error').length} errors /{' '}
+              {validationIssues.filter((issue) => issue.level === 'warning').length} warnings
+            </span>
             {canvasConnectMode && selectedNode && <span className="toolbar-chip">connecting from {selectedNode.name}</span>}
             {!canvasConnectMode && connectionMessage.tone === 'error' && <span className="toolbar-chip error">{connectionMessage.text}</span>}
           </div>
@@ -738,13 +939,13 @@ export function App() {
                 <g key={edge.id}>
                   <path
                     d={`M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`}
-                    stroke="url(#edgeGlow)"
+                    stroke={edge.networkPolicy === 'deny' ? '#ff6b6b' : 'url(#edgeGlow)'}
                     strokeWidth="3"
                     fill="none"
-                    strokeDasharray={edge.type === 'async' ? '12 6' : edge.type === 'data' ? '4 4' : undefined}
+                    strokeDasharray={edge.networkPolicy === 'deny' ? '2 8' : edge.type === 'async' ? '12 6' : edge.type === 'data' ? '4 4' : undefined}
                   />
                   <text x={(x1 + x2) / 2} y={Math.min(y1, y2) - 10} textAnchor="middle" className="edge-label">
-                    {edge.type} | {edge.latencyBudgetMs}ms
+                    {edge.type} | {edge.latencyBudgetMs}ms | {edge.networkPolicy}
                   </text>
                 </g>
               );
@@ -826,8 +1027,22 @@ export function App() {
 
               const nodeKindLabel = node.type.toUpperCase();
               const runtimeLabel = `${node.image}:${node.tag}`;
-              const pinTargetLabel = node.type === 'database' ? 'storage' : node.type === 'queue' ? 'events' : 'in';
-              const pinSourceLabel = node.type === 'ingress' ? 'route' : node.type === 'database' ? 'rows' : 'out';
+              const pinTargetLabel =
+                node.type === 'database' || node.type === 'cache'
+                  ? 'storage'
+                  : node.type === 'queue'
+                    ? 'events'
+                    : node.type === 'job' || node.type === 'cronjob'
+                      ? 'trigger'
+                      : 'in';
+              const pinSourceLabel =
+                node.type === 'ingress'
+                  ? 'route'
+                  : node.type === 'database'
+                    ? 'rows'
+                    : node.type === 'job' || node.type === 'cronjob' || node.type === 'worker'
+                      ? 'deps'
+                      : 'out';
 
               return (
                 <g
@@ -885,7 +1100,7 @@ export function App() {
                     {runtimeLabel}
                   </text>
                   <text x={position.x + 16} y={position.y + 106} className="node-meta">
-                    ns {node.namespace} | svc {node.service.port}
+                    ns {node.namespace} | {node.workload.kind}
                   </text>
                   <text x={position.x + 16} y={position.y + 126} className="node-meta">
                     sa {node.serviceAccountName}
@@ -979,6 +1194,21 @@ export function App() {
                 <span>{selectedNodeResolved.namespace}</span>
                 <span>{model.activeEnvironment}</span>
               </div>
+              <div className="behavior-card">
+                <strong>Behavior</strong>
+                <span>{selectedNodeBehavior}</span>
+              </div>
+              <div className="quick-actions" aria-label="Quick actions">
+                <button type="button" className="ghost-button" onClick={applyProdReadyProfile}>
+                  Prod-ready
+                </button>
+                <button type="button" className="ghost-button" onClick={applyPublicTlsIngress}>
+                  Public TLS ingress
+                </button>
+                <button type="button" className="ghost-button" onClick={applyDurableStorageProfile}>
+                  Durable storage
+                </button>
+              </div>
             </div>
 
             <div className="section-card">
@@ -1011,6 +1241,185 @@ export function App() {
                 <label className="span-two">
                   Service account
                   <input value={selectedNode.serviceAccountName} onChange={(event) => updateNode({ serviceAccountName: event.target.value })} />
+                </label>
+              </div>
+            </div>
+
+            <div className="section-card">
+              <div className="section-title">Workload</div>
+              <div className="field-grid">
+                <label>
+                  Kubernetes kind
+                  <select
+                    value={selectedNode.workload.kind}
+                    onChange={(event) =>
+                      updateNode({
+                        workload: {
+                          ...selectedNode.workload,
+                          kind: event.target.value as ArchitectureNode['workload']['kind'],
+                          restartPolicy:
+                            event.target.value === 'Job' || event.target.value === 'CronJob'
+                              ? selectedNode.workload.restartPolicy === 'Always'
+                                ? 'OnFailure'
+                                : selectedNode.workload.restartPolicy
+                              : 'Always',
+                        },
+                      })
+                    }
+                  >
+                    <option value="Deployment">Deployment</option>
+                    <option value="StatefulSet">StatefulSet</option>
+                    <option value="Job">Job</option>
+                    <option value="CronJob">CronJob</option>
+                  </select>
+                </label>
+                <label>
+                  Restart policy
+                  <select
+                    value={selectedNode.workload.restartPolicy}
+                    onChange={(event) =>
+                      updateNode({
+                        workload: { ...selectedNode.workload, restartPolicy: event.target.value as ArchitectureNode['workload']['restartPolicy'] },
+                      })
+                    }
+                  >
+                    <option value="Always">Always</option>
+                    <option value="OnFailure">OnFailure</option>
+                    <option value="Never">Never</option>
+                  </select>
+                </label>
+                <label>
+                  Completions
+                  <input
+                    type="number"
+                    min="1"
+                    value={selectedNode.workload.completions}
+                    onChange={(event) => updateNode({ workload: { ...selectedNode.workload, completions: Number(event.target.value) } })}
+                  />
+                </label>
+                <label>
+                  Parallelism
+                  <input
+                    type="number"
+                    min="1"
+                    value={selectedNode.workload.parallelism}
+                    onChange={(event) => updateNode({ workload: { ...selectedNode.workload, parallelism: Number(event.target.value) } })}
+                  />
+                </label>
+                <label>
+                  Backoff limit
+                  <input
+                    type="number"
+                    min="0"
+                    value={selectedNode.workload.backoffLimit}
+                    onChange={(event) => updateNode({ workload: { ...selectedNode.workload, backoffLimit: Number(event.target.value) } })}
+                  />
+                </label>
+                <label>
+                  Termination grace
+                  <input
+                    type="number"
+                    min="0"
+                    value={selectedNode.workload.terminationGracePeriodSeconds}
+                    onChange={(event) =>
+                      updateNode({ workload: { ...selectedNode.workload, terminationGracePeriodSeconds: Number(event.target.value) } })
+                    }
+                  />
+                </label>
+                <label>
+                  Cron schedule
+                  <input
+                    value={selectedNode.workload.schedule}
+                    onChange={(event) => updateNode({ workload: { ...selectedNode.workload, schedule: event.target.value } })}
+                  />
+                </label>
+                <label className="span-two">
+                  Command
+                  <textarea
+                    className="code-input compact-input"
+                    value={selectedNode.workload.command.join('\n')}
+                    onChange={(event) => updateNode({ workload: { ...selectedNode.workload, command: parseListInput(event.target.value) } })}
+                  />
+                </label>
+                <label className="span-two">
+                  Args
+                  <textarea
+                    className="code-input compact-input"
+                    value={selectedNode.workload.args.join('\n')}
+                    onChange={(event) => updateNode({ workload: { ...selectedNode.workload, args: parseListInput(event.target.value) } })}
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="section-card">
+              <div className="section-title">Security</div>
+              <div className="field-grid">
+                <label className="span-two">
+                  Image pull secrets
+                  <textarea
+                    className="code-input compact-input"
+                    value={selectedNode.imagePullSecrets.join('\n')}
+                    onChange={(event) =>
+                      updateNode({
+                        imagePullSecrets: event.target.value
+                          .split('\n')
+                          .map((line) => line.trim())
+                          .filter(Boolean),
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  Run as user
+                  <input
+                    type="number"
+                    min="0"
+                    value={selectedNode.security.runAsUser}
+                    onChange={(event) => updateNode({ security: { ...selectedNode.security, runAsUser: Number(event.target.value) } })}
+                  />
+                </label>
+                <label>
+                  Seccomp profile
+                  <select
+                    value={selectedNode.security.seccompProfile}
+                    onChange={(event) =>
+                      updateNode({
+                        security: {
+                          ...selectedNode.security,
+                          seccompProfile: event.target.value as ArchitectureNode['security']['seccompProfile'],
+                        },
+                      })
+                    }
+                  >
+                    <option value="RuntimeDefault">RuntimeDefault</option>
+                    <option value="Localhost">Localhost</option>
+                    <option value="Unconfined">Unconfined</option>
+                  </select>
+                </label>
+                <label className="toggle-row">
+                  <span>Run as non-root</span>
+                  <input
+                    type="checkbox"
+                    checked={selectedNode.security.runAsNonRoot}
+                    onChange={(event) => updateNode({ security: { ...selectedNode.security, runAsNonRoot: event.target.checked } })}
+                  />
+                </label>
+                <label className="toggle-row">
+                  <span>Read-only root FS</span>
+                  <input
+                    type="checkbox"
+                    checked={selectedNode.security.readOnlyRootFilesystem}
+                    onChange={(event) => updateNode({ security: { ...selectedNode.security, readOnlyRootFilesystem: event.target.checked } })}
+                  />
+                </label>
+                <label className="toggle-row span-two">
+                  <span>Allow privilege escalation</span>
+                  <input
+                    type="checkbox"
+                    checked={selectedNode.security.allowPrivilegeEscalation}
+                    onChange={(event) => updateNode({ security: { ...selectedNode.security, allowPrivilegeEscalation: event.target.checked } })}
+                  />
                 </label>
               </div>
             </div>
@@ -1147,9 +1556,35 @@ export function App() {
               <div className="section-title">Service</div>
               <div className="field-grid">
                 <label>
+                  Exposure
+                  <select
+                    value={selectedNode.service.exposure}
+                    onChange={(event) =>
+                      updateNode({ service: { ...selectedNode.service, exposure: event.target.value as ArchitectureNode['service']['exposure'] } })
+                    }
+                  >
+                    <option value="internal">Internal</option>
+                    <option value="external">External</option>
+                  </select>
+                </label>
+                <label>
+                  LB scope
+                  <select
+                    value={selectedNode.service.loadBalancerScope}
+                    onChange={(event) =>
+                      updateNode({
+                        service: { ...selectedNode.service, loadBalancerScope: event.target.value as ArchitectureNode['service']['loadBalancerScope'] },
+                      })
+                    }
+                  >
+                    <option value="private">Private</option>
+                    <option value="public">Public</option>
+                  </select>
+                </label>
+                <label>
                   Service type
                   <select
-                    value={selectedNode.service.type}
+                    value={selectedNodeResolved.service.type}
                     onChange={(event) => updateNode({ service: { ...selectedNode.service, type: event.target.value as ArchitectureNode['service']['type'] } })}
                   >
                     <option value="ClusterIP">ClusterIP</option>
@@ -1159,7 +1594,24 @@ export function App() {
                 </label>
                 <label>
                   Service port
-                  <input type="number" min="1" value={selectedNode.service.port} onChange={(event) => updateNode({ service: { ...selectedNode.service, port: Number(event.target.value) } })} />
+                  <input type="number" min="1" value={selectedNodeResolved.service.port} onChange={(event) => updateNode({ service: { ...selectedNode.service, port: Number(event.target.value) } })} />
+                </label>
+                <label className="span-two">
+                  External traffic policy
+                  <select
+                    value={selectedNode.service.externalTrafficPolicy}
+                    onChange={(event) =>
+                      updateNode({
+                        service: {
+                          ...selectedNode.service,
+                          externalTrafficPolicy: event.target.value as ArchitectureNode['service']['externalTrafficPolicy'],
+                        },
+                      })
+                    }
+                  >
+                    <option value="Cluster">Cluster</option>
+                    <option value="Local">Local</option>
+                  </select>
                 </label>
               </div>
             </div>
@@ -1190,8 +1642,34 @@ export function App() {
               <div className="section-title">Health checks</div>
               <div className="field-grid">
                 <label>
+                  Readiness type
+                  <select
+                    value={selectedNode.readinessProbe.type}
+                    onChange={(event) =>
+                      updateNode({ readinessProbe: { ...selectedNode.readinessProbe, type: event.target.value as ArchitectureNode['readinessProbe']['type'] } })
+                    }
+                  >
+                    <option value="http">HTTP</option>
+                    <option value="tcp">TCP</option>
+                    <option value="exec">Exec</option>
+                  </select>
+                </label>
+                <label>
                   Readiness path
                   <input value={selectedNode.readinessProbe.path} onChange={(event) => updateNode({ readinessProbe: { ...selectedNode.readinessProbe, path: event.target.value } })} />
+                </label>
+                <label>
+                  Liveness type
+                  <select
+                    value={selectedNode.livenessProbe.type}
+                    onChange={(event) =>
+                      updateNode({ livenessProbe: { ...selectedNode.livenessProbe, type: event.target.value as ArchitectureNode['livenessProbe']['type'] } })
+                    }
+                  >
+                    <option value="http">HTTP</option>
+                    <option value="tcp">TCP</option>
+                    <option value="exec">Exec</option>
+                  </select>
                 </label>
                 <label>
                   Liveness path
@@ -1207,6 +1685,63 @@ export function App() {
                       updateNode({
                         readinessProbe: { ...selectedNode.readinessProbe, port: Number(event.target.value) },
                         livenessProbe: { ...selectedNode.livenessProbe, port: Number(event.target.value) },
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  Failure threshold
+                  <input
+                    type="number"
+                    min="1"
+                    value={selectedNode.readinessProbe.failureThreshold}
+                    onChange={(event) =>
+                      updateNode({
+                        readinessProbe: { ...selectedNode.readinessProbe, failureThreshold: Number(event.target.value) },
+                        livenessProbe: { ...selectedNode.livenessProbe, failureThreshold: Number(event.target.value) },
+                      })
+                    }
+                  />
+                </label>
+                <label className="toggle-row span-two">
+                  <span>Enable startup probe</span>
+                  <input
+                    type="checkbox"
+                    checked={selectedNode.startupProbe.enabled}
+                    onChange={(event) => updateNode({ startupProbe: { ...selectedNode.startupProbe, enabled: event.target.checked } })}
+                  />
+                </label>
+                <label>
+                  Startup type
+                  <select
+                    value={selectedNode.startupProbe.type}
+                    onChange={(event) =>
+                      updateNode({ startupProbe: { ...selectedNode.startupProbe, type: event.target.value as ArchitectureNode['startupProbe']['type'] } })
+                    }
+                  >
+                    <option value="http">HTTP</option>
+                    <option value="tcp">TCP</option>
+                    <option value="exec">Exec</option>
+                  </select>
+                </label>
+                <label>
+                  Startup failure threshold
+                  <input
+                    type="number"
+                    min="1"
+                    value={selectedNode.startupProbe.failureThreshold}
+                    onChange={(event) => updateNode({ startupProbe: { ...selectedNode.startupProbe, failureThreshold: Number(event.target.value) } })}
+                  />
+                </label>
+                <label className="span-two">
+                  Probe command
+                  <input
+                    value={selectedNode.startupProbe.command || selectedNode.readinessProbe.command}
+                    onChange={(event) =>
+                      updateNode({
+                        startupProbe: { ...selectedNode.startupProbe, command: event.target.value },
+                        readinessProbe: { ...selectedNode.readinessProbe, command: event.target.value },
+                        livenessProbe: { ...selectedNode.livenessProbe, command: event.target.value },
                       })
                     }
                   />
@@ -1283,15 +1818,110 @@ export function App() {
                 </label>
                 <label>
                   Storage class
-                  <input value={selectedNode.storage.storageClassName} onChange={(event) => updateNode({ storage: { ...selectedNode.storage, storageClassName: event.target.value } })} />
+                  <input value={selectedNodeResolved.storage.storageClassName} onChange={(event) => updateNode({ storage: { ...selectedNode.storage, storageClassName: event.target.value } })} />
+                </label>
+                <label>
+                  Access mode
+                  <select
+                    value={selectedNode.storage.accessMode}
+                    onChange={(event) =>
+                      updateNode({ storage: { ...selectedNode.storage, accessMode: event.target.value as ArchitectureNode['storage']['accessMode'] } })
+                    }
+                  >
+                    <option value="ReadWriteOnce">ReadWriteOnce</option>
+                    <option value="ReadWriteOncePod">ReadWriteOncePod</option>
+                    <option value="ReadOnlyMany">ReadOnlyMany</option>
+                    <option value="ReadWriteMany">ReadWriteMany</option>
+                  </select>
+                </label>
+                <label>
+                  Volume mode
+                  <select
+                    value={selectedNode.storage.volumeMode}
+                    onChange={(event) =>
+                      updateNode({ storage: { ...selectedNode.storage, volumeMode: event.target.value as ArchitectureNode['storage']['volumeMode'] } })
+                    }
+                  >
+                    <option value="Filesystem">Filesystem</option>
+                    <option value="Block">Block</option>
+                  </select>
                 </label>
                 <label className="span-two">
                   Mount path
                   <input value={selectedNode.storage.mountPath} onChange={(event) => updateNode({ storage: { ...selectedNode.storage, mountPath: event.target.value } })} />
                 </label>
+                <label>
+                  Retain on delete
+                  <select
+                    value={selectedNode.storage.retainOnDelete}
+                    onChange={(event) =>
+                      updateNode({
+                        storage: { ...selectedNode.storage, retainOnDelete: event.target.value as ArchitectureNode['storage']['retainOnDelete'] },
+                      })
+                    }
+                  >
+                    <option value="Retain">Retain</option>
+                    <option value="Delete">Delete</option>
+                  </select>
+                </label>
+                <label>
+                  Retain on scale-down
+                  <select
+                    value={selectedNode.storage.retainOnScaleDown}
+                    onChange={(event) =>
+                      updateNode({
+                        storage: { ...selectedNode.storage, retainOnScaleDown: event.target.value as ArchitectureNode['storage']['retainOnScaleDown'] },
+                      })
+                    }
+                  >
+                    <option value="Retain">Retain</option>
+                    <option value="Delete">Delete</option>
+                  </select>
+                </label>
+                <label className="toggle-row span-two">
+                  <span>Backup intent</span>
+                  <input
+                    type="checkbox"
+                    checked={selectedNode.storage.backupEnabled}
+                    onChange={(event) => updateNode({ storage: { ...selectedNode.storage, backupEnabled: event.target.checked } })}
+                  />
+                </label>
+                <label className="span-two">
+                  Backup schedule
+                  <input
+                    value={selectedNode.storage.backupSchedule}
+                    onChange={(event) => updateNode({ storage: { ...selectedNode.storage, backupSchedule: event.target.value } })}
+                  />
+                </label>
                 <label className="toggle-row span-two">
                   <span>Enable ingress</span>
                   <input type="checkbox" checked={selectedNode.ingress.enabled} onChange={(event) => updateNode({ ingress: { ...selectedNode.ingress, enabled: event.target.checked } })} />
+                </label>
+                <label>
+                  Ingress exposure
+                  <select
+                    value={selectedNode.ingress.exposure}
+                    onChange={(event) =>
+                      updateNode({ ingress: { ...selectedNode.ingress, exposure: event.target.value as ArchitectureNode['ingress']['exposure'] } })
+                    }
+                  >
+                    <option value="internal">Internal</option>
+                    <option value="external">External</option>
+                  </select>
+                </label>
+                <label>
+                  Ingress LB scope
+                  <select
+                    value={selectedNode.ingress.loadBalancerScope}
+                    onChange={(event) =>
+                      updateNode({
+                        ingress: { ...selectedNode.ingress, loadBalancerScope: event.target.value as ArchitectureNode['ingress']['loadBalancerScope'] },
+                      })
+                    }
+                  >
+                    <option value="private">Private</option>
+                    <option value="public">Public</option>
+                  </select>
                 </label>
                 <label>
                   Ingress host
@@ -1300,6 +1930,14 @@ export function App() {
                 <label>
                   Ingress path
                   <input value={selectedNode.ingress.path} onChange={(event) => updateNode({ ingress: { ...selectedNode.ingress, path: event.target.value } })} />
+                </label>
+                <label>
+                  Ingress class
+                  <input value={selectedNodeResolved.ingress.ingressClassName} onChange={(event) => updateNode({ ingress: { ...selectedNode.ingress, ingressClassName: event.target.value } })} />
+                </label>
+                <label>
+                  TLS issuer
+                  <input value={selectedNode.ingress.tlsIssuer} onChange={(event) => updateNode({ ingress: { ...selectedNode.ingress, tlsIssuer: event.target.value } })} />
                 </label>
                 <label className="toggle-row">
                   <span>Enable TLS</span>
@@ -1339,6 +1977,15 @@ export function App() {
               <div className="mini-metrics">
                 <span>{validationIssues.filter((issue) => issue.level === 'error').length} errors</span>
                 <span>{validationIssues.filter((issue) => issue.level === 'warning').length} warnings</span>
+              </div>
+              <div className="validation-list">
+                {validationIssues.slice(0, 8).map((issue) => (
+                  <div key={`${issue.level}-${issue.message}`} className={`validation-item ${issue.level}`}>
+                    <strong>{issue.level}</strong>
+                    <span>{issue.message}</span>
+                  </div>
+                ))}
+                {validationIssues.length > 8 && <div className="node-type-description">Showing 8 of {validationIssues.length} validation issues.</div>}
               </div>
               <button type="button" className="danger-button wide" onClick={deleteSelectedNode}>
                 Delete node

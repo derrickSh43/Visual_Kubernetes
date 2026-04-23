@@ -86,6 +86,10 @@ button {
   min-width: 0;
 }
 
+.environment-switcher {
+  margin-left: auto;
+}
+
 .editor-brand-mark {
   display: inline-flex;
   align-items: center;
@@ -406,6 +410,61 @@ button {
   font-size: 0.88rem;
 }
 
+.behavior-card {
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid #34373d;
+  border-left: 3px solid #2f7ff2;
+  border-radius: 4px;
+  background: #15171b;
+  color: #aeb4bd;
+  font-size: 0.82rem;
+}
+
+.behavior-card strong,
+.edge-guidance-title {
+  color: #d8dce2;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.edge-guidance,
+.quick-actions {
+  display: grid;
+  gap: 8px;
+}
+
+.edge-target-button {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+  border: 1px solid #34373d;
+  border-radius: 4px;
+  background: #14161a;
+  color: #d8dce2;
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.edge-target-button:hover {
+  border-color: #3e80da;
+  background: #1a202b;
+}
+
+.edge-target-button strong {
+  color: #8fc7ff;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.quick-actions {
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+}
+
 .derived-env-list {
   display: grid;
   gap: 8px;
@@ -432,6 +491,41 @@ button {
   font-size: 0.8rem;
   font-family: Consolas, "Courier New", monospace;
   word-break: break-all;
+}
+
+.validation-list {
+  display: grid;
+  gap: 7px;
+  margin: 10px 0;
+}
+
+.validation-item {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px;
+  align-items: start;
+  padding: 8px 9px;
+  border: 1px solid #343840;
+  border-radius: 4px;
+  background: #141518;
+  color: #cbd0d6;
+  font-size: 0.78rem;
+}
+
+.validation-item strong {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.68rem;
+}
+
+.validation-item.error {
+  border-color: #6d2b31;
+  background: #211315;
+}
+
+.validation-item.warning {
+  border-color: #5f4a1f;
+  background: #1f1a10;
 }
 
 .status-chip {
@@ -516,6 +610,10 @@ textarea:focus {
   min-height: 84px;
   resize: vertical;
   font-family: Consolas, "Courier New", monospace;
+}
+
+.compact-input {
+  min-height: 58px;
 }
 
 .primary-button,

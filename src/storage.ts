@@ -1,10 +1,13 @@
 import { starterWorkspace } from './data';
 import type {
+  ArchitectureEdge,
   ArchitectureNode,
   AutoscalingConfig,
   IngressConfig,
   ProbeConfig,
   ResourceConfig,
+  WorkloadConfig,
+  SecurityConfig,
   ServiceConfig,
   StorageConfig,
   WorkspaceState,
@@ -12,13 +15,18 @@ import type {
 
 export const WORKSPACE_STORAGE_KEY = 'visual-kubernetes/workspace';
 
-function defaultProbe(port: number): ProbeConfig {
+function defaultProbeForNode(node: ArchitectureNode, label: 'readiness' | 'liveness' | 'startup', port: number): ProbeConfig {
+  const probeType = node.type === 'database' || node.type === 'queue' || node.type === 'cache' ? 'tcp' : 'http';
+  const path = label === 'liveness' ? '/health' : '/ready';
   return {
-    enabled: true,
-    path: '/health',
+    enabled: label === 'startup' ? node.type !== 'job' && node.type !== 'cronjob' : true,
+    type: probeType,
+    path,
     port,
-    initialDelaySeconds: 10,
-    periodSeconds: 10,
+    command: '',
+    initialDelaySeconds: label === 'startup' ? 20 : 10,
+    periodSeconds: label === 'startup' ? 5 : 10,
+    failureThreshold: label === 'startup' ? 30 : 3,
   };
 }
 
@@ -33,10 +41,33 @@ function defaultResources(): ResourceConfig {
 
 function defaultAutoscaling(node: ArchitectureNode): AutoscalingConfig {
   return {
-    enabled: ['service', 'frontend', 'gateway', 'worker'].includes(node.type),
+    enabled: ['service', 'frontend', 'gateway'].includes(node.type),
     minReplicas: 2,
     maxReplicas: 6,
     targetCPUUtilizationPercentage: 70,
+  };
+}
+
+function defaultWorkload(node: ArchitectureNode): WorkloadConfig {
+  const kind =
+    node.type === 'database' || node.type === 'queue' || node.type === 'cache'
+      ? 'StatefulSet'
+      : node.type === 'job'
+        ? 'Job'
+        : node.type === 'cronjob'
+          ? 'CronJob'
+          : 'Deployment';
+
+  return {
+    kind,
+    schedule: '*/15 * * * *',
+    completions: 1,
+    parallelism: 1,
+    backoffLimit: 3,
+    restartPolicy: kind === 'Job' || kind === 'CronJob' ? 'OnFailure' : 'Always',
+    command: [],
+    args: [],
+    terminationGracePeriodSeconds: node.type === 'database' || node.type === 'queue' ? 60 : kind === 'Job' || kind === 'CronJob' ? 30 : 45,
   };
 }
 
@@ -45,12 +76,18 @@ function defaultStorage(node: ArchitectureNode): StorageConfig {
     enabled: node.type === 'database' || node.type === 'queue' || node.type === 'cache',
     size: node.type === 'database' ? '20Gi' : node.type === 'queue' ? '8Gi' : node.type === 'cache' ? '4Gi' : '5Gi',
     storageClassName: 'standard',
+    accessMode: 'ReadWriteOnce',
+    volumeMode: 'Filesystem',
     mountPath:
       node.type === 'database'
         ? '/var/lib/postgresql/data'
         : node.type === 'queue'
           ? '/var/lib/rabbitmq'
           : '/data',
+    retainOnDelete: node.type === 'database' || node.type === 'queue' ? 'Retain' : 'Delete',
+    retainOnScaleDown: node.type === 'database' || node.type === 'queue' ? 'Retain' : 'Delete',
+    backupEnabled: node.type === 'database' || node.type === 'queue',
+    backupSchedule: '0 2 * * *',
   };
 }
 
@@ -58,6 +95,9 @@ function defaultService(node: ArchitectureNode): ServiceConfig {
   return {
     type: 'ClusterIP',
     port: node.type === 'database' ? 5432 : node.type === 'queue' ? 5672 : node.type === 'cache' ? 6379 : 80,
+    exposure: node.type === 'ingress' ? 'external' : 'internal',
+    loadBalancerScope: node.type === 'ingress' ? 'public' : 'private',
+    externalTrafficPolicy: 'Cluster',
   };
 }
 
@@ -68,7 +108,20 @@ function defaultIngress(node: ArchitectureNode): IngressConfig {
     path: '/',
     tlsEnabled: false,
     tlsSecretName: `${node.id}-tls`,
+    tlsIssuer: '',
     ingressClassName: 'nginx',
+    exposure: node.type === 'ingress' ? 'external' : 'internal',
+    loadBalancerScope: node.type === 'ingress' ? 'public' : 'private',
+  };
+}
+
+function defaultSecurity(node: ArchitectureNode): SecurityConfig {
+  return {
+    runAsNonRoot: node.type !== 'database' && node.type !== 'queue',
+    runAsUser: node.type === 'database' || node.type === 'queue' ? 999 : 1000,
+    readOnlyRootFilesystem: node.type !== 'database' && node.type !== 'queue' && node.type !== 'cache',
+    allowPrivilegeEscalation: false,
+    seccompProfile: 'RuntimeDefault',
   };
 }
 
@@ -98,14 +151,25 @@ function hydrateNode(node: ArchitectureNode, defaultNamespace: string): Architec
     env: node.env ?? [],
     secretEnv: hydrateSecretEnv(node),
     resources: node.resources ?? defaultResources(),
-    readinessProbe: node.readinessProbe ?? defaultProbe(port),
-    livenessProbe: node.livenessProbe ?? defaultProbe(port),
+    readinessProbe: { ...defaultProbeForNode(node, 'readiness', port), ...node.readinessProbe },
+    livenessProbe: { ...defaultProbeForNode(node, 'liveness', port), ...node.livenessProbe },
+    startupProbe: { ...defaultProbeForNode(node, 'startup', port), ...node.startupProbe },
     autoscaling: node.autoscaling ?? defaultAutoscaling(node),
-    storage: node.storage ?? defaultStorage(node),
-    service: node.service ?? defaultService(node),
+    workload: { ...defaultWorkload(node), ...node.workload },
+    storage: { ...defaultStorage(node), ...node.storage },
+    service: { ...defaultService(node), ...node.service },
     serviceAccountName: node.serviceAccountName ?? `${node.id}-sa`,
-    ingress: node.ingress ?? defaultIngress(node),
+    imagePullSecrets: node.imagePullSecrets ?? [],
+    security: node.security ?? defaultSecurity(node),
+    ingress: { ...defaultIngress(node), ...node.ingress },
     environmentOverrides: node.environmentOverrides ?? {},
+  };
+}
+
+function hydrateEdge(edge: ArchitectureEdge): ArchitectureEdge {
+  return {
+    ...edge,
+    networkPolicy: edge.networkPolicy ?? 'allow',
   };
 }
 
@@ -134,6 +198,7 @@ export function loadWorkspace(): WorkspaceState {
         provider: parsed.model.provider ?? 'generic',
         activeEnvironment: parsed.model.activeEnvironment ?? 'prod',
         nodes: parsed.model.nodes.map((node) => hydrateNode(node as ArchitectureNode, defaultNamespace)),
+        edges: parsed.model.edges.map((edge) => hydrateEdge(edge as ArchitectureEdge)),
       },
     };
   } catch {
