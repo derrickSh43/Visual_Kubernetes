@@ -4,8 +4,11 @@ import type {
   CloudProvider,
   DeploymentPlan,
   EdgeType,
+  EnvironmentVariable,
+  EnvironmentName,
   ExportDocument,
   PatternType,
+  ResourceConfig,
   ValidationIssue,
 } from './types';
 
@@ -83,6 +86,14 @@ function envConfigMapName(node: ArchitectureNode) {
   return `${sanitizeName(node.name)}-config`;
 }
 
+function inlineSecretEntries(node: ArchitectureNode) {
+  return node.secretEnv.filter((entry) => entry.source === 'inline');
+}
+
+function referencedSecretEntries(node: ArchitectureNode) {
+  return node.secretEnv.filter((entry) => entry.source === 'existingSecret');
+}
+
 function providerLoadBalancerAnnotation(provider: CloudProvider) {
   if (provider === 'aws') {
     return ['  annotations:', '    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"'];
@@ -113,10 +124,116 @@ function providerIngressAnnotations(provider: CloudProvider) {
   return [];
 }
 
+function envKeyBase(name: string) {
+  return sanitizeName(name).toUpperCase().replace(/-/g, '_');
+}
+
+function qualifiedServiceHost(fromNode: ArchitectureNode, toNode: ArchitectureNode) {
+  const serviceName = sanitizeName(toNode.name);
+  const targetNamespace = sanitizeName(toNode.namespace) || 'default';
+  const fromNamespace = sanitizeName(fromNode.namespace) || 'default';
+  return fromNamespace === targetNamespace ? serviceName : `${serviceName}.${targetNamespace}.svc.cluster.local`;
+}
+
+function deriveEdgeEnvironmentVariables(fromNode: ArchitectureNode, toNode: ArchitectureNode, edgeType: EdgeType): EnvironmentVariable[] {
+  const keyBase = envKeyBase(toNode.name);
+  const host = qualifiedServiceHost(fromNode, toNode);
+
+  if (edgeType === 'http') {
+    return [
+      { key: `${keyBase}_SERVICE_HOST`, value: host },
+      { key: `${keyBase}_SERVICE_PORT`, value: String(toNode.service.port) },
+      { key: `${keyBase}_SERVICE_URL`, value: `http://${host}:${toNode.service.port}` },
+    ];
+  }
+
+  if (edgeType === 'async') {
+    return [
+      { key: `${keyBase}_QUEUE_HOST`, value: host },
+      { key: `${keyBase}_QUEUE_PORT`, value: String(toNode.service.port) },
+      { key: `${keyBase}_QUEUE_URL`, value: `amqp://${host}:${toNode.service.port}` },
+    ];
+  }
+
+  const kindSuffix = toNode.type === 'cache' ? 'CACHE' : 'DATABASE';
+  return [
+    { key: `${keyBase}_${kindSuffix}_HOST`, value: host },
+    { key: `${keyBase}_${kindSuffix}_PORT`, value: String(toNode.service.port) },
+  ];
+}
+
+function mergeEnvironmentVariables(derived: EnvironmentVariable[], manual: EnvironmentVariable[]) {
+  const merged = new Map<string, EnvironmentVariable>();
+  for (const entry of derived) {
+    merged.set(entry.key, entry);
+  }
+  for (const entry of manual) {
+    merged.set(entry.key, entry);
+  }
+  return [...merged.values()];
+}
+
+export function getDerivedEnvironmentVariables(model: ArchitectureModel, nodeId: string): EnvironmentVariable[] {
+  const resolvedModel = getResolvedModel(model);
+  const fromNode = getNode(resolvedModel, nodeId);
+  if (!fromNode) {
+    return [];
+  }
+
+  return resolvedModel.edges.flatMap((edge) => {
+    if (edge.from !== nodeId) {
+      return [];
+    }
+    const toNode = getNode(resolvedModel, edge.to);
+    if (!toNode) {
+      return [];
+    }
+    return deriveEdgeEnvironmentVariables(fromNode, toNode, edge.type);
+  });
+}
+
+export function getMergedEnvironmentVariables(model: ArchitectureModel, nodeId: string): EnvironmentVariable[] {
+  const resolvedModel = getResolvedModel(model);
+  const node = getNode(resolvedModel, nodeId);
+  if (!node) {
+    return [];
+  }
+
+  return mergeEnvironmentVariables(getDerivedEnvironmentVariables(model, nodeId), node.env);
+}
+
+function mergeResources(base: ResourceConfig, override?: Partial<ResourceConfig>) {
+  return override ? { ...base, ...override } : base;
+}
+
+export function resolveNodeForEnvironment(node: ArchitectureNode, environment: EnvironmentName): ArchitectureNode {
+  const override = node.environmentOverrides?.[environment];
+  if (!override) {
+    return node;
+  }
+
+  return {
+    ...node,
+    replicas: override.replicas ?? node.replicas,
+    tag: override.tag ?? node.tag,
+    resources: mergeResources(node.resources, override.resources),
+    autoscaling: override.autoscaling ? { ...node.autoscaling, ...override.autoscaling } : node.autoscaling,
+    ingress: override.ingress ? { ...node.ingress, ...override.ingress } : node.ingress,
+  };
+}
+
+export function getResolvedModel(model: ArchitectureModel): ArchitectureModel {
+  return {
+    ...model,
+    nodes: model.nodes.map((node) => resolveNodeForEnvironment(node, model.activeEnvironment)),
+  };
+}
+
 export function detectPattern(model: ArchitectureModel): PatternType {
-  const serviceCount = model.nodes.filter((node) => ['service', 'frontend', 'gateway', 'worker'].includes(node.type)).length;
-  const queueCount = countNodeType(model, 'queue');
-  const databaseCount = countNodeType(model, 'database');
+  const resolvedModel = getResolvedModel(model);
+  const serviceCount = resolvedModel.nodes.filter((node) => ['service', 'frontend', 'gateway', 'worker'].includes(node.type)).length;
+  const queueCount = countNodeType(resolvedModel, 'queue');
+  const databaseCount = countNodeType(resolvedModel, 'database');
 
   if (serviceCount <= 1 && databaseCount <= 1) {
     return 'monolith';
@@ -171,16 +288,17 @@ export function canConnectNodes(fromNode: ArchitectureNode, toNode: Architecture
 }
 
 export function validateArchitecture(model: ArchitectureModel): ValidationIssue[] {
+  const resolvedModel = getResolvedModel(model);
   const issues: ValidationIssue[] = [];
 
-  if (model.nodes.length === 0) {
+  if (resolvedModel.nodes.length === 0) {
     issues.push({ level: 'error', message: 'Add at least one node before generating a deployment plan.' });
   }
 
   const duplicateNames = new Set<string>();
   const seenNames = new Set<string>();
 
-  for (const node of model.nodes) {
+  for (const node of resolvedModel.nodes) {
     if (seenNames.has(node.name.toLowerCase())) {
       duplicateNames.add(node.name);
     }
@@ -207,15 +325,34 @@ export function validateArchitecture(model: ArchitectureModel): ValidationIssue[
     if (node.ingress.enabled && !node.ingress.host.trim()) {
       issues.push({ level: 'error', message: `${node.name} ingress is enabled but host is missing.` });
     }
+    for (const secretEntry of node.secretEnv) {
+      if (secretEntry.source === 'inline' && !secretEntry.value.trim()) {
+        issues.push({ level: 'error', message: `${node.name} secret ${secretEntry.key} is inline but empty.` });
+      }
+      if (secretEntry.source === 'existingSecret' && (!secretEntry.secretName.trim() || !secretEntry.secretKey.trim())) {
+        issues.push({ level: 'error', message: `${node.name} secret ${secretEntry.key} must reference both a secret name and key.` });
+      }
+    }
+
+    const derivedEnv = getDerivedEnvironmentVariables(resolvedModel, node.id);
+    for (const derivedEntry of derivedEnv) {
+      const manualEntry = node.env.find((entry) => entry.key === derivedEntry.key);
+      if (manualEntry && manualEntry.value !== derivedEntry.value) {
+        issues.push({
+          level: 'warning',
+          message: `${node.name} overrides ${derivedEntry.key}, but the graph implies ${derivedEntry.value}.`,
+        });
+      }
+    }
   }
 
   for (const duplicateName of duplicateNames) {
     issues.push({ level: 'error', message: `Duplicate node name detected: ${duplicateName}.` });
   }
 
-  for (const edge of model.edges) {
-    const fromNode = getNode(model, edge.from);
-    const toNode = getNode(model, edge.to);
+  for (const edge of resolvedModel.edges) {
+    const fromNode = getNode(resolvedModel, edge.from);
+    const toNode = getNode(resolvedModel, edge.to);
 
     if (!fromNode || !toNode) {
       issues.push({ level: 'error', message: `Connection ${edge.id} references a missing node.` });
@@ -228,12 +365,12 @@ export function validateArchitecture(model: ArchitectureModel): ValidationIssue[
     }
   }
 
-  const ingressNodes = model.nodes.filter((node) => node.type === 'ingress');
+  const ingressNodes = resolvedModel.nodes.filter((node) => node.type === 'ingress');
   if (ingressNodes.length === 0) {
     issues.push({ level: 'warning', message: 'No ingress node found. External traffic has no entry point.' });
   }
 
-  const criticalDatabases = model.nodes.filter((node) => node.type === 'database' && node.sla === 'critical');
+  const criticalDatabases = resolvedModel.nodes.filter((node) => node.type === 'database' && node.sla === 'critical');
   for (const database of criticalDatabases) {
     if (database.replicas < 2) {
       issues.push({
@@ -247,18 +384,21 @@ export function validateArchitecture(model: ArchitectureModel): ValidationIssue[
 }
 
 export function generateDeploymentPlan(model: ArchitectureModel): DeploymentPlan {
+  const resolvedModel = getResolvedModel(model);
   const pattern = detectPattern(model);
-  const estimatedMonthlyCost = model.nodes.reduce((sum, node) => {
+  const estimatedMonthlyCost = resolvedModel.nodes.reduce((sum, node) => {
     const base = baseCostByType[node.type];
     const sizeFactor = node.cpu * 35 + node.memory * 18;
     const replicaFactor = Math.max(node.replicas, 1);
     return sum + (base + sizeFactor) * replicaFactor;
   }, 0);
 
-  const namespaces = [...new Set(model.nodes.map((node) => node.namespace))];
+  const namespaces = [...new Set(resolvedModel.nodes.map((node) => node.namespace))];
   const kubernetesObjects = [
     ...namespaces.map((namespace) => `Namespace/${namespace}`),
-    ...model.nodes.flatMap((node) => {
+    ...resolvedModel.nodes.flatMap((node) => {
+      const inlineSecrets = inlineSecretEntries(node);
+      const referencedSecrets = referencedSecretEntries(node);
       const items = [
         `ServiceAccount/${node.serviceAccountName}`,
         node.type === 'database' ? `StatefulSet/${node.name}` : `Deployment/${node.name}`,
@@ -267,9 +407,10 @@ export function generateDeploymentPlan(model: ArchitectureModel): DeploymentPlan
       if (node.env.length > 0) {
         items.push(`ConfigMap/${envConfigMapName(node)}`);
       }
-      if (node.secretEnv.length > 0) {
+      if (inlineSecrets.length > 0) {
         items.push(`Secret/${envSecretName(node)}`);
       }
+      referencedSecrets.forEach((secret) => items.push(`SecretRef/${secret.secretName}`));
       if (node.storage.enabled) {
         items.push(`PersistentVolumeClaim/${node.name}`);
       }
@@ -290,9 +431,9 @@ export function generateDeploymentPlan(model: ArchitectureModel): DeploymentPlan
     estimatedMonthlyCost: Math.round(estimatedMonthlyCost),
     kubernetesObjects,
     strengths: [
-      `${model.nodes.length} components modeled with ${model.edges.length} validated relationships.`,
-      `Pattern detection suggests a ${pattern} architecture with generated defaults.`,
-      'Namespaces, service accounts, config/secrets, storage, ingress, and scaling are carried into export output.',
+      `${resolvedModel.nodes.length} components modeled with ${resolvedModel.edges.length} validated relationships for ${resolvedModel.activeEnvironment}.`,
+      `Pattern detection suggests a ${pattern} architecture with environment-aware defaults.`,
+      'Namespaces, service accounts, graph-derived dependency config, storage, ingress, scaling, and environment overlays are carried into export output.',
     ],
     warnings: validateArchitecture(model)
       .filter((issue) => issue.level === 'warning')
@@ -301,17 +442,22 @@ export function generateDeploymentPlan(model: ArchitectureModel): DeploymentPlan
 }
 
 export function generateKubernetesDocuments(model: ArchitectureModel): ExportDocument[] {
-  const namespaces = [...new Set(model.nodes.map((node) => sanitizeName(node.namespace) || 'default'))];
+  const resolvedModel = getResolvedModel(model);
+  const namespaces = [...new Set(resolvedModel.nodes.map((node) => sanitizeName(node.namespace) || 'default'))];
   const documents: ExportDocument[] = namespaces.map((namespace) => ({
     kind: 'Namespace',
     name: namespace,
     yaml: ['apiVersion: v1', 'kind: Namespace', 'metadata:', `  name: ${namespace}`].join('\n'),
   }));
 
-  for (const node of model.nodes) {
+  for (const node of resolvedModel.nodes) {
     const namespace = sanitizeName(node.namespace) || 'default';
     const appName = sanitizeName(node.name);
     const labels = indent([`app: ${appName}`, `component: ${node.type}`], 8);
+
+    const mergedEnv = getMergedEnvironmentVariables(resolvedModel, node.id);
+    const inlineSecrets = inlineSecretEntries(node);
+    const referencedSecrets = referencedSecretEntries(node);
 
     documents.push({
       kind: 'ServiceAccount',
@@ -319,7 +465,7 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
       yaml: ['apiVersion: v1', 'kind: ServiceAccount', 'metadata:', `  name: ${node.serviceAccountName}`, `  namespace: ${namespace}`].join('\n'),
     });
 
-    if (node.env.length > 0) {
+    if (mergedEnv.length > 0) {
       documents.push({
         kind: 'ConfigMap',
         name: `${namespace}-${envConfigMapName(node)}`,
@@ -330,12 +476,12 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
           `  name: ${envConfigMapName(node)}`,
           `  namespace: ${namespace}`,
           'data:',
-          ...node.env.map((variable) => `  ${variable.key}: "${variable.value.replace(/"/g, '\\"')}"`),
+          ...mergedEnv.map((variable) => `  ${variable.key}: "${variable.value.replace(/"/g, '\\"')}"`),
         ].join('\n'),
       });
     }
 
-    if (node.secretEnv.length > 0) {
+    if (inlineSecrets.length > 0) {
       documents.push({
         kind: 'Secret',
         name: `${namespace}-${envSecretName(node)}`,
@@ -347,18 +493,26 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
           `  namespace: ${namespace}`,
           'type: Opaque',
           'stringData:',
-          ...node.secretEnv.map((variable) => `  ${variable.key}: "${variable.value.replace(/"/g, '\\"')}"`),
+          ...inlineSecrets.map((variable) => `  ${variable.key}: "${variable.value.replace(/"/g, '\\"')}"`),
         ].join('\n'),
       });
     }
 
     const envFromLines: string[] = [];
-    if (node.env.length > 0) {
+    if (mergedEnv.length > 0) {
       envFromLines.push('  envFrom:', '    - configMapRef:', `        name: ${envConfigMapName(node)}`);
     }
-    if (node.secretEnv.length > 0) {
+    if (inlineSecrets.length > 0) {
       envFromLines.push('    - secretRef:', `        name: ${envSecretName(node)}`);
     }
+
+    const directSecretEnvLines = referencedSecrets.flatMap((variable) => [
+      `  - name: ${variable.key}`,
+      '    valueFrom:',
+      '      secretKeyRef:',
+      `        name: ${variable.secretName}`,
+      `        key: ${variable.secretKey}`,
+    ]);
 
     const volumeMountLines = node.storage.enabled
       ? ['  volumeMounts:', '    - name: app-storage', `      mountPath: ${node.storage.mountPath}`]
@@ -382,6 +536,7 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
       '    limits:',
       `      cpu: "${node.resources.limitsCpu}"`,
       `      memory: "${node.resources.limitsMemory}"`,
+      ...(directSecretEnvLines.length > 0 ? ['  env:', ...directSecretEnvLines] : []),
       ...envFromLines,
       ...probeLinesForNode(node, 'readinessProbe'),
       ...probeLinesForNode(node, 'livenessProbe'),
@@ -459,7 +614,7 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
         'metadata:',
         `  name: ${appName}`,
         `  namespace: ${namespace}`,
-        ...(node.service.type === 'LoadBalancer' ? providerLoadBalancerAnnotation(model.provider) : []),
+        ...(node.service.type === 'LoadBalancer' ? providerLoadBalancerAnnotation(resolvedModel.provider) : []),
         'spec:',
         `  type: ${node.service.type}`,
         '  selector:',
@@ -471,8 +626,8 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
     });
 
     if (node.ingress.enabled) {
-      const backend = model.edges
-        .map((edge) => (edge.from === node.id ? getNode(model, edge.to) : undefined))
+      const backend = resolvedModel.edges
+        .map((edge) => (edge.from === node.id ? getNode(resolvedModel, edge.to) : undefined))
         .find((candidate) => candidate && ['service', 'frontend', 'gateway'].includes(candidate.type));
       const backendName = sanitizeName(backend?.name ?? node.name);
 
@@ -482,7 +637,7 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
         'metadata:',
         `  name: ${appName}`,
         `  namespace: ${namespace}`,
-        ...providerIngressAnnotations(model.provider),
+        ...providerIngressAnnotations(resolvedModel.provider),
         'spec:',
         `  ingressClassName: ${node.ingress.ingressClassName}`,
       ];
@@ -556,9 +711,9 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
     });
   }
 
-  for (const edge of model.edges) {
-    const fromNode = getNode(model, edge.from);
-    const toNode = getNode(model, edge.to);
+  for (const edge of resolvedModel.edges) {
+    const fromNode = getNode(resolvedModel, edge.from);
+    const toNode = getNode(resolvedModel, edge.to);
     if (!fromNode || !toNode) continue;
 
     const fromApp = sanitizeName(fromNode.name);
@@ -619,6 +774,7 @@ export function generateKubernetesYaml(model: ArchitectureModel): string {
 
 export function generateTerraform(model: ArchitectureModel): string {
   const documents = generateKubernetesDocuments(model);
+  const resolvedModel = getResolvedModel(model);
   const resources = documents.map((document, index) => {
     const resourceName = `${document.kind.toLowerCase()}_${sanitizeName(document.name) || index}`;
     return [
@@ -646,7 +802,8 @@ export function generateTerraform(model: ArchitectureModel): string {
     '  config_path = "~/.kube/config"',
     '}',
     '',
-    `# Target cloud provider: ${model.provider}`,
+    `# Target cloud provider: ${resolvedModel.provider}`,
+    `# Active environment: ${resolvedModel.activeEnvironment}`,
     '# Cluster provisioning is not yet emitted here; this output assumes the cluster already exists.',
     '',
     ...resources,
@@ -654,31 +811,35 @@ export function generateTerraform(model: ArchitectureModel): string {
 }
 
 export function generateProjectFiles(model: ArchitectureModel) {
-  const namespaces = [...new Set(model.nodes.map((node) => sanitizeName(node.namespace) || 'default'))];
+  const resolvedModel = getResolvedModel(model);
+  const namespaces = [...new Set(resolvedModel.nodes.map((node) => sanitizeName(node.namespace) || 'default'))];
+  const environment = resolvedModel.activeEnvironment;
   return [
     {
-      path: 'k8s/manifests.yaml',
+      path: `k8s/${environment}/manifests.yaml`,
       content: generateKubernetesYaml(model),
     },
     ...namespaces.map((namespace) => ({
-      path: `k8s/namespaces/${namespace}/README.md`,
-      content: `Namespace ${namespace}\n`,
+      path: `k8s/${environment}/namespaces/${namespace}/README.md`,
+      content: `Namespace ${namespace} for ${environment}\n`,
     })),
     {
-      path: 'terraform/main.tf',
+      path: `terraform/${environment}/main.tf`,
       content: generateTerraform(model),
     },
     {
       path: 'README.md',
       content: [
-        `# ${model.name}`,
+        `# ${resolvedModel.name}`,
         '',
-        `Provider: ${model.provider}`,
-        `Default namespace: ${model.defaultNamespace}`,
+        `Provider: ${resolvedModel.provider}`,
+        `Active environment: ${resolvedModel.activeEnvironment}`,
+        `Default namespace: ${resolvedModel.defaultNamespace}`,
         '',
         '## Notes',
         '- This package assumes an existing Kubernetes cluster.',
         '- Nodes can target separate namespaces for more realistic environment separation.',
+        '- Environment overlays are applied before YAML and Terraform are generated.',
       ].join('\n'),
     },
   ];

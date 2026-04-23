@@ -33,6 +33,24 @@ describe('App', () => {
     expect(screen.getByDisplayValue('prod-checkout')).toBeInTheDocument();
   });
 
+  it('switches the active environment and updates export output', () => {
+    render(<App />);
+
+    fireEvent.change(screen.getAllByLabelText(/Environment/i)[0]!, { target: { value: 'dev' } });
+
+    expect(screen.getByLabelText(/yaml export/i)).toHaveTextContent('api.dev.checkout.internal');
+    expect(screen.getByLabelText(/yaml export/i)).toHaveTextContent('checkout-service:1.0.0-dev');
+  });
+
+  it('shows graph-derived dependency wiring for the selected node', () => {
+    render(<App />);
+
+    fireEvent.click(screen.getAllByText('Checkout Service').at(-1)!);
+
+    expect(screen.getByText('INVENTORY_SERVICE_SERVICE_URL')).toBeInTheDocument();
+    expect(screen.getByText('amqp://domain-events.platform.svc.cluster.local:5672')).toBeInTheDocument();
+  });
+
   it('connects a newly added node from the connection form', () => {
     render(<App />);
 

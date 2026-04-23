@@ -72,6 +72,19 @@ function defaultIngress(node: ArchitectureNode): IngressConfig {
   };
 }
 
+function hydrateSecretEnv(node: ArchitectureNode): ArchitectureNode['secretEnv'] {
+  return (node.secretEnv ?? []).map((entry: ArchitectureNode['secretEnv'][number] | { key: string; value: string }) => {
+    if ('source' in entry) {
+      return entry;
+    }
+    return {
+      source: 'inline' as const,
+      key: entry.key,
+      value: entry.value,
+    };
+  });
+}
+
 function hydrateNode(node: ArchitectureNode, defaultNamespace: string): ArchitectureNode {
   const port =
     node.containerPort ?? (node.type === 'database' ? 5432 : node.type === 'queue' ? 5672 : node.type === 'cache' ? 6379 : node.type === 'ingress' ? 80 : 8080);
@@ -83,7 +96,7 @@ function hydrateNode(node: ArchitectureNode, defaultNamespace: string): Architec
     tag: node.tag ?? 'latest',
     containerPort: port,
     env: node.env ?? [],
-    secretEnv: node.secretEnv ?? [],
+    secretEnv: hydrateSecretEnv(node),
     resources: node.resources ?? defaultResources(),
     readinessProbe: node.readinessProbe ?? defaultProbe(port),
     livenessProbe: node.livenessProbe ?? defaultProbe(port),
@@ -92,6 +105,7 @@ function hydrateNode(node: ArchitectureNode, defaultNamespace: string): Architec
     service: node.service ?? defaultService(node),
     serviceAccountName: node.serviceAccountName ?? `${node.id}-sa`,
     ingress: node.ingress ?? defaultIngress(node),
+    environmentOverrides: node.environmentOverrides ?? {},
   };
 }
 
@@ -118,6 +132,7 @@ export function loadWorkspace(): WorkspaceState {
         ...parsed.model,
         defaultNamespace,
         provider: parsed.model.provider ?? 'generic',
+        activeEnvironment: parsed.model.activeEnvironment ?? 'prod',
         nodes: parsed.model.nodes.map((node) => hydrateNode(node as ArchitectureNode, defaultNamespace)),
       },
     };

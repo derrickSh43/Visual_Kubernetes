@@ -2,6 +2,7 @@ export type NodeType = 'ingress' | 'frontend' | 'gateway' | 'service' | 'worker'
 export type EdgeType = 'http' | 'async' | 'data';
 export type PatternType = 'monolith' | 'microservices' | 'event-driven' | 'hybrid';
 export type CloudProvider = 'aws' | 'gcp' | 'azure' | 'generic';
+export type EnvironmentName = 'dev' | 'stage' | 'prod';
 
 export interface ProbeConfig {
   enabled: boolean;
@@ -30,10 +31,20 @@ export interface EnvironmentVariable {
   value: string;
 }
 
-export interface SecretVariable {
+export interface InlineSecretVariable {
+  source: 'inline';
   key: string;
   value: string;
 }
+
+export interface ExistingSecretReference {
+  source: 'existingSecret';
+  key: string;
+  secretName: string;
+  secretKey: string;
+}
+
+export type SecretVariable = InlineSecretVariable | ExistingSecretReference;
 
 export interface StorageConfig {
   enabled: boolean;
@@ -54,6 +65,14 @@ export interface IngressConfig {
   tlsEnabled: boolean;
   tlsSecretName: string;
   ingressClassName: string;
+}
+
+export interface NodeEnvironmentOverride {
+  replicas?: number;
+  tag?: string;
+  resources?: Partial<ResourceConfig>;
+  autoscaling?: Partial<AutoscalingConfig>;
+  ingress?: Partial<Pick<IngressConfig, 'host' | 'tlsSecretName'>>;
 }
 
 export interface ArchitectureNode {
@@ -78,6 +97,7 @@ export interface ArchitectureNode {
   service: ServiceConfig;
   serviceAccountName: string;
   ingress: IngressConfig;
+  environmentOverrides?: Partial<Record<EnvironmentName, NodeEnvironmentOverride>>;
 }
 
 export interface ArchitectureEdge {
@@ -92,6 +112,7 @@ export interface ArchitectureModel {
   name: string;
   defaultNamespace: string;
   provider: CloudProvider;
+  activeEnvironment: EnvironmentName;
   nodes: ArchitectureNode[];
   edges: ArchitectureEdge[];
 }

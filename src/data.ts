@@ -1,4 +1,13 @@
-import type { ArchitectureEdge, ArchitectureModel, ArchitectureNode, CanvasLayout, NodeType, WorkspaceState } from './types';
+import type {
+  ArchitectureEdge,
+  ArchitectureModel,
+  ArchitectureNode,
+  CanvasLayout,
+  EnvironmentName,
+  NodeEnvironmentOverride,
+  NodeType,
+  WorkspaceState,
+} from './types';
 
 export const availableNodeTypes: Array<{ type: NodeType; label: string; description: string }> = [
   { type: 'frontend', label: 'Frontend', description: 'Browser-facing web app' },
@@ -10,6 +19,8 @@ export const availableNodeTypes: Array<{ type: NodeType; label: string; descript
   { type: 'database', label: 'Database', description: 'Persistent stateful storage' },
   { type: 'ingress', label: 'Ingress', description: 'External traffic entrypoint' },
 ];
+
+export const supportedEnvironments: EnvironmentName[] = ['dev', 'stage', 'prod'];
 
 function baseProbe(path: string, port: number) {
   return {
@@ -104,8 +115,13 @@ function createNode(id: string, name: string, type: NodeType, overrides: Partial
       tlsSecretName: `${id}-tls`,
       ingressClassName: 'nginx',
     },
+    environmentOverrides: {},
     ...overrides,
   };
+}
+
+function envOverride(overrides: Partial<Record<EnvironmentName, NodeEnvironmentOverride>>) {
+  return overrides;
 }
 
 export const starterNodes: ArchitectureNode[] = [
@@ -119,6 +135,20 @@ export const starterNodes: ArchitectureNode[] = [
       tlsSecretName: 'checkout-api-tls',
       ingressClassName: 'nginx',
     },
+    environmentOverrides: envOverride({
+      dev: {
+        ingress: {
+          host: 'api.dev.checkout.internal',
+          tlsSecretName: 'checkout-api-dev-tls',
+        },
+      },
+      stage: {
+        ingress: {
+          host: 'api.stage.checkout.internal',
+          tlsSecretName: 'checkout-api-stage-tls',
+        },
+      },
+    }),
   }),
   createNode('service-checkout', 'Checkout Service', 'service', {
     replicas: 3,
@@ -133,16 +163,55 @@ export const starterNodes: ArchitectureNode[] = [
       { key: 'DATABASE_HOST', value: 'orders-db.data' },
     ],
     secretEnv: [
-      { key: 'DATABASE_PASSWORD', value: 'change-me' },
-      { key: 'JWT_SECRET', value: 'replace-me' },
+      { source: 'existingSecret', key: 'DATABASE_PASSWORD', secretName: 'checkout-service-runtime', secretKey: 'database-password' },
+      { source: 'inline', key: 'JWT_SECRET', value: 'replace-me' },
     ],
+    environmentOverrides: envOverride({
+      dev: {
+        replicas: 1,
+        tag: '1.0.0-dev',
+        resources: {
+          requestsCpu: '150m',
+          requestsMemory: '192Mi',
+          limitsCpu: '500m',
+          limitsMemory: '512Mi',
+        },
+        autoscaling: {
+          enabled: false,
+          minReplicas: 1,
+          maxReplicas: 1,
+        },
+      },
+      stage: {
+        replicas: 2,
+        tag: '1.0.0-rc',
+        ingress: {
+          host: 'checkout.stage.internal',
+        },
+      },
+    }),
   }),
   createNode('service-inventory', 'Inventory Service', 'service', {
     namespace: 'inventory',
     image: 'ghcr.io/visual-kubernetes/inventory-service',
     tag: '1.0.0',
     env: [{ key: 'QUEUE_HOST', value: 'domain-events.platform' }],
-    secretEnv: [{ key: 'QUEUE_PASSWORD', value: 'change-me' }],
+    secretEnv: [{ source: 'existingSecret', key: 'QUEUE_PASSWORD', secretName: 'inventory-runtime', secretKey: 'queue-password' }],
+    environmentOverrides: envOverride({
+      dev: {
+        replicas: 1,
+        tag: '1.0.0-dev',
+        resources: {
+          requestsCpu: '150m',
+          requestsMemory: '192Mi',
+          limitsCpu: '500m',
+          limitsMemory: '512Mi',
+        },
+      },
+      stage: {
+        tag: '1.0.0-rc',
+      },
+    }),
   }),
   createNode('queue-events', 'Domain Events', 'queue', {
     namespace: 'platform',
@@ -164,7 +233,19 @@ export const starterNodes: ArchitectureNode[] = [
       storageClassName: 'standard',
       mountPath: '/var/lib/rabbitmq',
     },
-    secretEnv: [{ key: 'RABBITMQ_DEFAULT_PASS', value: 'change-me' }],
+    secretEnv: [{ source: 'inline', key: 'RABBITMQ_DEFAULT_PASS', value: 'change-me' }],
+    environmentOverrides: envOverride({
+      dev: {
+        replicas: 1,
+        tag: '3-management-alpine',
+        resources: {
+          requestsCpu: '150m',
+          requestsMemory: '256Mi',
+          limitsCpu: '500m',
+          limitsMemory: '768Mi',
+        },
+      },
+    }),
   }),
   createNode('db-orders', 'Orders DB', 'database', {
     namespace: 'data',
@@ -174,8 +255,8 @@ export const starterNodes: ArchitectureNode[] = [
     service: { type: 'ClusterIP', port: 5432 },
     env: [{ key: 'POSTGRES_DB', value: 'orders' }],
     secretEnv: [
-      { key: 'POSTGRES_USER', value: 'orders_app' },
-      { key: 'POSTGRES_PASSWORD', value: 'change-me' },
+      { source: 'inline', key: 'POSTGRES_USER', value: 'orders_app' },
+      { source: 'existingSecret', key: 'POSTGRES_PASSWORD', secretName: 'orders-db-runtime', secretKey: 'postgres-password' },
     ],
     readinessProbe: {
       enabled: true,
@@ -203,6 +284,25 @@ export const starterNodes: ArchitectureNode[] = [
       storageClassName: 'premium-rwo',
       mountPath: '/var/lib/postgresql/data',
     },
+    environmentOverrides: envOverride({
+      dev: {
+        tag: '16-alpine',
+        resources: {
+          requestsCpu: '250m',
+          requestsMemory: '512Mi',
+          limitsCpu: '1000m',
+          limitsMemory: '2Gi',
+        },
+      },
+      stage: {
+        resources: {
+          requestsCpu: '350m',
+          requestsMemory: '768Mi',
+          limitsCpu: '1500m',
+          limitsMemory: '3Gi',
+        },
+      },
+    }),
   }),
 ];
 
@@ -217,6 +317,7 @@ export const starterArchitecture: ArchitectureModel = {
   name: 'Checkout Platform',
   defaultNamespace: 'checkout-platform',
   provider: 'aws',
+  activeEnvironment: 'prod',
   nodes: starterNodes,
   edges: starterEdges,
 };
@@ -254,5 +355,17 @@ export function createNodeTemplate(type: NodeType, defaultNamespace = 'visual-ku
                 : type === 'queue'
                   ? 'Queue'
                   : 'Ingress';
-  return createNode(`${type}-${sequence}`, `${labelBase} ${sequence}`, type, { namespace: defaultNamespace });
+  return createNode(`${type}-${sequence}`, `${labelBase} ${sequence}`, type, {
+    namespace: defaultNamespace,
+    environmentOverrides: {
+      dev: {
+        replicas: type === 'database' ? 1 : 1,
+        tag: type === 'ingress' ? 'dev' : 'latest-dev',
+      },
+      stage: {
+        replicas: type === 'database' ? 1 : 2,
+        tag: type === 'ingress' ? 'stage' : 'latest-rc',
+      },
+    },
+  });
 }

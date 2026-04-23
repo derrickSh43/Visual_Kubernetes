@@ -1,18 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import JSZip from 'jszip';
-import { availableNodeTypes, createNodeTemplate, starterWorkspace } from './data';
+import { availableNodeTypes, createNodeTemplate, starterWorkspace, supportedEnvironments } from './data';
 import {
   canConnectNodes,
   detectPattern,
   generateDeploymentPlan,
+  getDerivedEnvironmentVariables,
   generateKubernetesYaml,
   generateProjectFiles,
   generateTerraform,
+  getResolvedModel,
   inferEdgeType,
+  resolveNodeForEnvironment,
   validateArchitecture,
 } from './engine';
 import { loadWorkspace, saveWorkspace } from './storage';
-import type { ArchitectureEdge, ArchitectureNode, EdgeType, NodeType, WorkspaceState } from './types';
+import type { ArchitectureEdge, ArchitectureNode, EdgeType, EnvironmentName, NodeType, WorkspaceState } from './types';
 
 const nodeColors: Record<NodeType, string> = {
   ingress: '#4dabf7',
@@ -28,12 +31,15 @@ const nodeColors: Record<NodeType, string> = {
 const canvasBounds = {
   width: 1600,
   height: 900,
-  nodeWidth: 220,
-  nodeHeight: 132,
+  nodeWidth: 248,
+  nodeHeight: 154,
 };
 
-const nodePortOffsetY = 106;
-const nodePortInset = 14;
+const nodePortOffsetY = 56;
+const nodePortInset = 12;
+const editorMenus = ['File', 'Edit', 'Asset', 'View', 'Graph', 'Tools', 'Help'];
+const actionBarItems = ['Compile', 'Save', 'Browse', 'Diff', 'Find', 'Blueprint Settings'];
+const workbenchTabs = ['Viewport', 'Cluster Graph', 'Runtime Model'];
 
 function nextLayoutPosition(count: number) {
   const column = count % 4;
@@ -42,6 +48,39 @@ function nextLayoutPosition(count: number) {
     x: 80 + column * 280,
     y: 100 + row * 180,
   };
+}
+
+function formatSecretEntry(entry: ArchitectureNode['secretEnv'][number]) {
+  if (entry.source === 'existingSecret') {
+    return `${entry.key}@${entry.secretName}#${entry.secretKey}`;
+  }
+  return `${entry.key}=${entry.value}`;
+}
+
+function parseSecretEntries(input: string): ArchitectureNode['secretEnv'] {
+  return input
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const referenceMatch = line.match(/^([^@=#]+)@([^#=]+)#(.+)$/);
+      if (referenceMatch) {
+        const [, key, secretName, secretKey] = referenceMatch;
+        return {
+          source: 'existingSecret' as const,
+          key: key.trim(),
+          secretName: secretName.trim(),
+          secretKey: secretKey.trim(),
+        };
+      }
+
+      const [key, ...rest] = line.split('=');
+      return {
+        source: 'inline' as const,
+        key: key.trim(),
+        value: rest.join('=').trim(),
+      };
+    });
 }
 
 export function App() {
@@ -74,12 +113,15 @@ export function App() {
   const edgeSequenceRef = useRef(0);
 
   const model = workspace.model;
+  const resolvedModel = useMemo(() => getResolvedModel(model), [model]);
   const layout = workspace.layout;
   const validationIssues = useMemo(() => validateArchitecture(model), [model]);
   const deploymentPlan = useMemo(() => generateDeploymentPlan(model), [model]);
   const yamlOutput = useMemo(() => generateKubernetesYaml(model), [model]);
   const terraformOutput = useMemo(() => generateTerraform(model), [model]);
   const selectedNode = model.nodes.find((node) => node.id === selectedNodeId) ?? model.nodes[0];
+  const selectedNodeResolved = selectedNode ? resolveNodeForEnvironment(selectedNode, model.activeEnvironment) : undefined;
+  const derivedSelectedNodeEnv = useMemo(() => (selectedNode ? getDerivedEnvironmentVariables(model, selectedNode.id) : []), [model, selectedNode]);
 
   useEffect(() => {
     saveWorkspace(workspace);
@@ -142,6 +184,31 @@ export function App() {
     }));
   }
 
+  function updateNodeEnvironmentOverride(
+    environment: EnvironmentName,
+    patch: NonNullable<ArchitectureNode['environmentOverrides']>[EnvironmentName],
+  ) {
+    if (!selectedNode) {
+      return;
+    }
+
+    const currentOverride = selectedNode.environmentOverrides?.[environment] ?? {};
+    const nextOverride = {
+      ...currentOverride,
+      ...patch,
+      resources: patch?.resources ? { ...currentOverride.resources, ...patch.resources } : currentOverride.resources,
+      autoscaling: patch?.autoscaling ? { ...currentOverride.autoscaling, ...patch.autoscaling } : currentOverride.autoscaling,
+      ingress: patch?.ingress ? { ...currentOverride.ingress, ...patch.ingress } : currentOverride.ingress,
+    };
+
+    updateNode({
+      environmentOverrides: {
+        ...selectedNode.environmentOverrides,
+        [environment]: nextOverride,
+      },
+    });
+  }
+
   function updateNodePosition(nodeId: string, x: number, y: number) {
     const clampedX = Math.min(Math.max(24, x), canvasBounds.width - canvasBounds.nodeWidth - 24);
     const clampedY = Math.min(Math.max(24, y), canvasBounds.height - canvasBounds.nodeHeight - 24);
@@ -170,7 +237,7 @@ export function App() {
 
     if (dragConnection) {
       let hoveredNodeId: string | null = null;
-      for (const node of model.nodes) {
+      for (const node of resolvedModel.nodes) {
         if (node.id === dragConnection.fromId) continue;
         const pos = layout[node.id];
         if (!pos) continue;
@@ -189,10 +256,10 @@ export function App() {
   }
 
   function handleSVGPointerUp() {
-    if (dragConnection) {
-      if (dragConnection.hoveredNodeId) {
-        const fromNode = model.nodes.find((n) => n.id === dragConnection.fromId);
-        const toNode = model.nodes.find((n) => n.id === dragConnection.hoveredNodeId);
+      if (dragConnection) {
+        if (dragConnection.hoveredNodeId) {
+        const fromNode = resolvedModel.nodes.find((n) => n.id === dragConnection.fromId);
+        const toNode = resolvedModel.nodes.find((n) => n.id === dragConnection.hoveredNodeId);
         if (fromNode && toNode) {
           const decision = canConnectNodes(fromNode, toNode);
           if (decision.allowed) {
@@ -416,7 +483,59 @@ export function App() {
   }
 
   return (
-    <div className="tool-shell">
+    <div className="app-frame">
+      <header className="editor-chrome">
+        <div className="editor-menubar">
+          <div className="editor-brand">
+            <span className="editor-brand-mark">VK</span>
+            <span className="editor-brand-text">Visual Kubernetes</span>
+          </div>
+          <nav className="editor-menu-items" aria-label="Editor menu">
+            {editorMenus.map((item) => (
+              <button key={item} type="button" className="menu-button">
+                {item}
+              </button>
+            ))}
+          </nav>
+          <div className="editor-context">
+            {model.activeEnvironment.toUpperCase()} | Provider {model.provider.toUpperCase()}
+          </div>
+        </div>
+
+        <div className="editor-actionbar">
+          <div className="editor-action-group">
+            {actionBarItems.map((item) => (
+              <button key={item} type="button" className="chrome-button">
+                {item}
+              </button>
+            ))}
+          </div>
+          <div className="editor-action-group">
+            <button type="button" className="chrome-button active">
+              Cluster Defaults
+            </button>
+            <button type="button" className="chrome-button">
+              Simulate
+            </button>
+            <button type="button" className="chrome-button">
+              Play
+            </button>
+          </div>
+        </div>
+
+        <div className="editor-tabbar">
+          <div className="editor-tab-track">
+            {workbenchTabs.map((tab, index) => (
+              <button key={tab} type="button" className={index === 1 ? 'workspace-tab active' : 'workspace-tab'}>
+                {tab}
+              </button>
+            ))}
+          </div>
+          <div className="editor-top-status">{model.activeEnvironment} environment active</div>
+        </div>
+      </header>
+
+      <div className="tool-shell">
       <aside className={`rail left-rail ${leftRailOpen ? 'open' : 'collapsed'}`} style={leftRailOpen ? { width: `${leftRailWidth}px` } : undefined}>
         <div className="rail-header">
           <strong>Components</strong>
@@ -447,6 +566,19 @@ export function App() {
                     <option value="gcp">GCP</option>
                     <option value="azure">Azure</option>
                     <option value="generic">Generic</option>
+                  </select>
+                </label>
+                <label>
+                  Environment
+                  <select
+                    value={model.activeEnvironment}
+                    onChange={(event) => updateModel({ activeEnvironment: event.target.value as EnvironmentName })}
+                  >
+                    {supportedEnvironments.map((environment) => (
+                      <option key={environment} value={environment}>
+                        {environment}
+                      </option>
+                    ))}
                   </select>
                 </label>
               </div>
@@ -547,9 +679,10 @@ export function App() {
       <main className="main-surface">
         <div className="toolbar">
           <div className="toolbar-group">
-            <strong>Visual Kubernetes</strong>
+            <strong>Cluster Graph</strong>
             <span className="toolbar-chip">{detectPattern(model)}</span>
             <span className="toolbar-chip">{deploymentPlan.nodeCount} nodes</span>
+            <span className="toolbar-chip">{model.activeEnvironment}</span>
             <span className="toolbar-chip">{model.provider}</span>
             {canvasConnectMode && selectedNode && <span className="toolbar-chip">connecting from {selectedNode.name}</span>}
             {!canvasConnectMode && connectionMessage.tone === 'error' && <span className="toolbar-chip error">{connectionMessage.text}</span>}
@@ -571,6 +704,7 @@ export function App() {
         </div>
 
         <section className="canvas-stage">
+          <div className="canvas-watermark">CLUSTER GRAPH</div>
           <svg
             viewBox={`0 0 ${canvasBounds.width} ${canvasBounds.height}`}
             role="img"
@@ -587,7 +721,7 @@ export function App() {
               </linearGradient>
             </defs>
 
-            {model.edges.map((edge) => {
+            {resolvedModel.edges.map((edge) => {
               const from = layout[edge.from];
               const to = layout[edge.to];
               if (!from || !to) {
@@ -621,8 +755,8 @@ export function App() {
                 const from = layout[dragConnection.fromId];
                 if (!from) return null;
 
-                const fromNode = model.nodes.find((n) => n.id === dragConnection.fromId);
-                const hoveredNode = dragConnection.hoveredNodeId ? model.nodes.find((n) => n.id === dragConnection.hoveredNodeId) : null;
+                const fromNode = resolvedModel.nodes.find((n) => n.id === dragConnection.fromId);
+                const hoveredNode = dragConnection.hoveredNodeId ? resolvedModel.nodes.find((n) => n.id === dragConnection.hoveredNodeId) : null;
                 const hoveredPos = dragConnection.hoveredNodeId ? layout[dragConnection.hoveredNodeId] : null;
                 const isValidTarget = fromNode && hoveredNode ? canConnectNodes(fromNode, hoveredNode).allowed : false;
 
@@ -650,7 +784,7 @@ export function App() {
                 );
               })()}
 
-            {model.nodes.map((node) => {
+            {resolvedModel.nodes.map((node) => {
               const position = layout[node.id];
               if (!position) {
                 return null;
@@ -660,7 +794,7 @@ export function App() {
               const headerColor = nodeColors[node.type];
               const isDragSource = dragConnection?.fromId === node.id;
               const isHoveredTarget = dragConnection?.hoveredNodeId === node.id;
-              const dragSourceNode = dragConnection ? model.nodes.find((n) => n.id === dragConnection.fromId) : undefined;
+              const dragSourceNode = dragConnection ? resolvedModel.nodes.find((n) => n.id === dragConnection.fromId) : undefined;
               const isValidDragTarget = dragSourceNode ? canConnectNodes(dragSourceNode, node).allowed : false;
               const isConnectModeTarget = canvasConnectMode && selectedNode && selectedNode.id !== node.id && canConnectNodes(selectedNode, node).allowed;
 
@@ -689,6 +823,11 @@ export function App() {
                 inputPortFill = '#ff6b6b';
                 inputPortStroke = '#ffd8de';
               }
+
+              const nodeKindLabel = node.type.toUpperCase();
+              const runtimeLabel = `${node.image}:${node.tag}`;
+              const pinTargetLabel = node.type === 'database' ? 'storage' : node.type === 'queue' ? 'events' : 'in';
+              const pinSourceLabel = node.type === 'ingress' ? 'route' : node.type === 'database' ? 'rows' : 'out';
 
               return (
                 <g
@@ -719,31 +858,45 @@ export function App() {
                   <rect
                     x={position.x}
                     y={position.y}
-                    rx="14"
-                    ry="14"
-                    width="220"
-                    height="132"
-                    fill={selected ? '#1a1f2b' : '#151922'}
+                    rx="8"
+                    ry="8"
+                    width={canvasBounds.nodeWidth}
+                    height={canvasBounds.nodeHeight}
+                    fill={selected ? '#1b1d22' : '#17191d'}
                     stroke={borderColor}
                     strokeWidth={borderWidth}
                   />
-                  <rect x={position.x} y={position.y} rx="14" ry="14" width="220" height="30" fill={headerColor} />
-                  <text x={position.x + 20} y={position.y + 20} className="node-header-text">
+                  <rect x={position.x} y={position.y} rx="8" ry="8" width={canvasBounds.nodeWidth} height="6" fill={headerColor} />
+                  <rect x={position.x + 1} y={position.y + 8} rx="6" ry="6" width={canvasBounds.nodeWidth - 2} height="28" fill="#101216" />
+                  <rect x={position.x + 1} y={position.y + 42} width={canvasBounds.nodeWidth - 2} height="1" fill="#2b3038" />
+                  <text x={position.x + 16} y={position.y + 28} className="node-header-text">
                     {node.name}
                   </text>
-                  <text x={position.x + 20} y={position.y + 52} className="node-meta">
-                    {node.image}:{node.tag}
+                  <text x={position.x + canvasBounds.nodeWidth - 16} y={position.y + 28} textAnchor="end" className="node-kind-text">
+                    {nodeKindLabel}
                   </text>
-                  <text x={position.x + 20} y={position.y + 74} className="node-meta">
+                  <text x={position.x + 26} y={position.y + 60} className="node-pin-label">
+                    {pinTargetLabel}
+                  </text>
+                  <text x={position.x + canvasBounds.nodeWidth - 26} y={position.y + 60} textAnchor="end" className="node-pin-label">
+                    {pinSourceLabel}
+                  </text>
+                  <text x={position.x + 16} y={position.y + 86} className="node-meta">
+                    {runtimeLabel}
+                  </text>
+                  <text x={position.x + 16} y={position.y + 106} className="node-meta">
                     ns {node.namespace} | svc {node.service.port}
                   </text>
-                  <text x={position.x + 20} y={position.y + 96} className="node-meta">
+                  <text x={position.x + 16} y={position.y + 126} className="node-meta">
                     sa {node.serviceAccountName}
+                  </text>
+                  <text x={position.x + 16} y={position.y + 144} className="node-footer-text">
+                    rep {node.replicas} | port {node.containerPort}
                   </text>
                   <circle
                     cx={position.x + nodePortInset}
                     cy={position.y + nodePortOffsetY}
-                    r="7"
+                    r="6"
                     fill={inputPortFill}
                     stroke={inputPortStroke}
                     strokeWidth="2"
@@ -752,7 +905,7 @@ export function App() {
                   <circle
                     cx={position.x + canvasBounds.nodeWidth - nodePortInset}
                     cy={position.y + nodePortOffsetY}
-                    r="7"
+                    r="6"
                     fill={isDragSource ? '#74c0fc' : headerColor}
                     stroke={isDragSource ? '#d0ebff' : '#0b0d12'}
                     strokeWidth="2"
@@ -816,14 +969,15 @@ export function App() {
             {rightRailOpen ? 'Hide' : 'Show'}
           </button>
         </div>
-        {rightRailOpen && selectedNode && (
+        {rightRailOpen && selectedNode && selectedNodeResolved && (
           <div className="rail-content inspector-content">
             <div className="section-card compact">
               <div className="section-title">Selected</div>
-              <div className="selected-name">{selectedNode.name}</div>
+              <div className="selected-name">{selectedNodeResolved.name}</div>
               <div className="selected-subtle">
-                <span>{selectedNode.type}</span>
-                <span>{selectedNode.namespace}</span>
+                <span>{selectedNodeResolved.type}</span>
+                <span>{selectedNodeResolved.namespace}</span>
+                <span>{model.activeEnvironment}</span>
               </div>
             </div>
 
@@ -857,6 +1011,134 @@ export function App() {
                 <label className="span-two">
                   Service account
                   <input value={selectedNode.serviceAccountName} onChange={(event) => updateNode({ serviceAccountName: event.target.value })} />
+                </label>
+              </div>
+            </div>
+
+            <div className="section-card">
+              <div className="section-title">Environment Overrides</div>
+              <div className="field-grid">
+                <label>
+                  Active environment
+                  <select
+                    value={model.activeEnvironment}
+                    onChange={(event) => updateModel({ activeEnvironment: event.target.value as EnvironmentName })}
+                  >
+                    {supportedEnvironments.map((environment) => (
+                      <option key={environment} value={environment}>
+                        {environment}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Effective tag
+                  <input
+                    value={selectedNodeResolved.tag}
+                    onChange={(event) => updateNodeEnvironmentOverride(model.activeEnvironment, { tag: event.target.value })}
+                  />
+                </label>
+                <label>
+                  Effective replicas
+                  <input
+                    type="number"
+                    min="1"
+                    value={selectedNodeResolved.replicas}
+                    onChange={(event) => updateNodeEnvironmentOverride(model.activeEnvironment, { replicas: Number(event.target.value) })}
+                  />
+                </label>
+                <label>
+                  Environment host
+                  <input
+                    value={selectedNodeResolved.ingress.host}
+                    onChange={(event) =>
+                      updateNodeEnvironmentOverride(model.activeEnvironment, {
+                        ingress: { host: event.target.value },
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  Env request CPU
+                  <input
+                    value={selectedNodeResolved.resources.requestsCpu}
+                    onChange={(event) =>
+                      updateNodeEnvironmentOverride(model.activeEnvironment, {
+                        resources: { requestsCpu: event.target.value },
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  Env request memory
+                  <input
+                    value={selectedNodeResolved.resources.requestsMemory}
+                    onChange={(event) =>
+                      updateNodeEnvironmentOverride(model.activeEnvironment, {
+                        resources: { requestsMemory: event.target.value },
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  Env limit CPU
+                  <input
+                    value={selectedNodeResolved.resources.limitsCpu}
+                    onChange={(event) =>
+                      updateNodeEnvironmentOverride(model.activeEnvironment, {
+                        resources: { limitsCpu: event.target.value },
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  Env limit memory
+                  <input
+                    value={selectedNodeResolved.resources.limitsMemory}
+                    onChange={(event) =>
+                      updateNodeEnvironmentOverride(model.activeEnvironment, {
+                        resources: { limitsMemory: event.target.value },
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  Env min replicas
+                  <input
+                    type="number"
+                    min="1"
+                    value={selectedNodeResolved.autoscaling.minReplicas}
+                    onChange={(event) =>
+                      updateNodeEnvironmentOverride(model.activeEnvironment, {
+                        autoscaling: { minReplicas: Number(event.target.value) },
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  Env max replicas
+                  <input
+                    type="number"
+                    min="1"
+                    value={selectedNodeResolved.autoscaling.maxReplicas}
+                    onChange={(event) =>
+                      updateNodeEnvironmentOverride(model.activeEnvironment, {
+                        autoscaling: { maxReplicas: Number(event.target.value) },
+                      })
+                    }
+                  />
+                </label>
+                <label className="span-two toggle-row">
+                  <span>Env HPA enabled</span>
+                  <input
+                    type="checkbox"
+                    checked={selectedNodeResolved.autoscaling.enabled}
+                    onChange={(event) =>
+                      updateNodeEnvironmentOverride(model.activeEnvironment, {
+                        autoscaling: { enabled: event.target.checked },
+                      })
+                    }
+                  />
                 </label>
               </div>
             </div>
@@ -958,22 +1240,34 @@ export function App() {
                   Secret entries
                   <textarea
                     className="code-input"
-                    value={selectedNode.secretEnv.map((entry) => `${entry.key}=${entry.value}`).join('\n')}
+                    value={selectedNode.secretEnv.map((entry) => formatSecretEntry(entry)).join('\n')}
                     onChange={(event) =>
                       updateNode({
-                        secretEnv: event.target.value
-                          .split('\n')
-                          .map((line) => line.trim())
-                          .filter(Boolean)
-                          .map((line) => {
-                            const [key, ...rest] = line.split('=');
-                            return { key: key.trim(), value: rest.join('=').trim() };
-                          }),
+                        secretEnv: parseSecretEntries(event.target.value),
                       })
                     }
                   />
                 </label>
+                <div className="node-type-description span-two">
+                  Use `KEY=value` for inline secrets or `KEY@secret-name#secret-key` to reference an existing Kubernetes secret.
+                </div>
               </div>
+            </div>
+
+            <div className="section-card">
+              <div className="section-title">Graph Wiring</div>
+              {derivedSelectedNodeEnv.length > 0 ? (
+                <div className="derived-env-list">
+                  {derivedSelectedNodeEnv.map((entry) => (
+                    <div key={entry.key} className="derived-env-item">
+                      <span className="derived-env-key">{entry.key}</span>
+                      <span className="derived-env-value">{entry.value}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="node-type-description">No dependency-derived config for this node yet.</div>
+              )}
             </div>
 
             <div className="section-card">
@@ -1053,6 +1347,7 @@ export function App() {
           </div>
         )}
       </aside>
+      </div>
     </div>
   );
 }
