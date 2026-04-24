@@ -57,21 +57,21 @@ Ordered for minimum rework and natural dependency flow.
 - Save-current-as-template and load-template (replace or merge-with-offset).
 - **Why seventh:** reuses library storage pattern + needs clusters to serialize correctly.
 
-## 8. Snapshots + versioning
+## 8. Snapshots + versioning [done]
 - IndexedDB-backed timestamped snapshots (localStorage too small for many full graphs).
 - Auto-snapshot on Save / template load / bulk ops; manual "Save" in action bar.
 - History panel (right rail tab): timeline, restore, delete, diff-vs-current.
 - Lightweight in-memory undo/redo stack separate from snapshots.
 - **Why eighth:** sits on top of stabilized model (clusters + templates now captured).
 
-## 9. Per-node YAML pane in bottom dock
+## 9. Per-node YAML pane in bottom dock [done]
 - Split YAML tab into **Selected node** + **Full stack** (or pane toggle).
 - Live-filter `generateKubernetesDocuments` by resources owned by the selected node (Deploy, Service, ConfigMap, Secret, Role, etc.).
 - Copy-selected / download-selected buttons.
 - Placeholder when nothing is selected.
 - **Why ninth:** small, self-contained — lands whenever.
 
-## 10. Wire up the action-bar buttons
+## 10. Wire up the action-bar buttons [done]
 - Compile → validate + YAML preview
 - Save → snapshot (step 8)
 - Browse → templates modal (step 7)

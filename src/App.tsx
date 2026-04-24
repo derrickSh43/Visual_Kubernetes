@@ -6,6 +6,7 @@ import {
   detectPattern,
   generateDeploymentPlan,
   getDerivedEnvironmentVariables,
+  generateKubernetesDocuments,
   generateKubernetesYaml,
   generateProjectFiles,
   generateTerraform,
@@ -18,11 +19,14 @@ import {
   loadCustomGraphTemplates,
   loadCustomNodeLibrary,
   loadWorkspace,
+  deleteSnapshot,
+  loadSnapshots,
   saveCustomGraphTemplates,
   saveCustomNodeLibrary,
+  saveSnapshot,
   saveWorkspace,
 } from './storage';
-import type { ArchitectureEdge, ArchitectureNode, CloudProvider, Cluster, EdgeType, EnvironmentName, GraphTemplate, NetworkPolicyIntent, NodeLibraryItem, NodeType, WorkspaceState } from './types';
+import type { ArchitectureEdge, ArchitectureNode, CloudProvider, Cluster, EdgeType, EnvironmentName, GraphTemplate, NetworkPolicyIntent, NodeLibraryItem, NodeType, WorkspaceSnapshot, WorkspaceState } from './types';
 
 const nodeColors: Record<NodeType, string> = {
   ingress: '#4dabf7',
@@ -44,6 +48,8 @@ const canvasBounds = {
   height: 900,
   nodeWidth: 248,
   nodeHeight: 154,
+  maxNodeWidth: 372,
+  maxNodeHeight: 231,
   padding: 240,
   minZoom: 0.35,
   maxZoom: 2.25,
@@ -51,16 +57,8 @@ const canvasBounds = {
 
 const nodePortOffsetY = 56;
 const nodePortInset = 12;
+type NodeSize = { width: number; height: number };
 const clusterPadding = 58;
-const editorMenus = [
-  { label: 'File', commands: 'New / Open / Save / Save As / Import YAML / Export ZIP / Recent' },
-  { label: 'Edit', commands: 'Undo / Redo / Copy / Paste / Duplicate / Select All / Find' },
-  { label: 'Asset', commands: 'Node Library / Templates / Import Asset' },
-  { label: 'View', commands: 'Fit to Content / Zoom 100% / Toggle Palette / Toggle Inspector / Toggle Dock / Grid' },
-  { label: 'Graph', commands: 'Validate / Auto-layout / Detect Pattern / Edge Filters' },
-  { label: 'Tools', commands: 'Compile / Simulate / Diff / Generate Docs' },
-  { label: 'Help', commands: 'Shortcuts / Docs / About' },
-];
 const actionBarItems = [
   { label: 'Compile', icon: 'CHK', intent: 'Validate graph and refresh YAML preview' },
   { label: 'Save', icon: 'SAV', intent: 'Create a local snapshot' },
@@ -69,7 +67,6 @@ const actionBarItems = [
   { label: 'Find', icon: 'FND', intent: 'Fuzzy-search nodes, edges, and generated resources' },
   { label: 'Blueprint Settings', icon: 'SET', intent: 'Edit stack-wide defaults' },
 ];
-const workbenchTabs = ['Viewport', 'Cluster Graph', 'Runtime Model'];
 
 const nodeBehaviorCopy: Record<NodeType, string> = {
   ingress: 'Ingress entrypoint: routes external traffic to frontend, gateway, or service nodes in the same namespace.',
@@ -110,20 +107,54 @@ function providerRegionDefault(provider: CloudProvider) {
   return 'us-east-1';
 }
 
-function clusterBounds(cluster: Cluster, layout: WorkspaceState['layout'], excludeNodeId?: string) {
+function nodeRuntimeLabel(node: ArchitectureNode) {
+  return `${node.image}:${node.tag}`;
+}
+
+function nodeMetaLabels(node: ArchitectureNode) {
+  return [
+    node.name,
+    node.type.toUpperCase(),
+    nodeRuntimeLabel(node),
+    `ns ${node.namespace} | ${node.workload.kind}`,
+    `sa ${node.serviceAccountName}`,
+    `rep ${node.replicas} | port ${node.containerPort}`,
+  ];
+}
+
+function estimateTextWidth(text: string, charWidth = 6.6) {
+  return text.length * charWidth;
+}
+
+function nodeSizeFor(node: ArchitectureNode): NodeSize {
+  const [name, kind, ...bodyLabels] = nodeMetaLabels(node);
+  const headerWidth = estimateTextWidth(name, 7.2) + estimateTextWidth(kind, 6.4) + 54;
+  const bodyWidth = Math.max(...bodyLabels.map((label) => estimateTextWidth(label, 6.2))) + 34;
+  const width = Math.ceil(clamp(Math.max(canvasBounds.nodeWidth, headerWidth, bodyWidth), canvasBounds.nodeWidth, canvasBounds.maxNodeWidth));
+  const extraBodyLines = bodyLabels.filter((label) => estimateTextWidth(label, 6.2) + 34 > width).length;
+  const height = Math.ceil(clamp(canvasBounds.nodeHeight + extraBodyLines * 16, canvasBounds.nodeHeight, canvasBounds.maxNodeHeight));
+
+  return { width, height };
+}
+
+function fitTextLength(text: string, availableWidth: number, charWidth = 6.4) {
+  return estimateTextWidth(text, charWidth) > availableWidth ? availableWidth : undefined;
+}
+
+function clusterBounds(cluster: Cluster, layout: WorkspaceState['layout'], nodeSizes: Map<string, NodeSize>, excludeNodeId?: string) {
   const positions = cluster.nodeIds
     .filter((nodeId) => nodeId !== excludeNodeId)
-    .map((nodeId) => layout[nodeId])
-    .filter(Boolean);
+    .map((nodeId) => ({ position: layout[nodeId], size: nodeSizes.get(nodeId) ?? { width: canvasBounds.nodeWidth, height: canvasBounds.nodeHeight } }))
+    .filter((entry) => entry.position);
 
   if (positions.length === 0) {
     return null;
   }
 
-  const minX = Math.min(...positions.map((position) => position.x));
-  const minY = Math.min(...positions.map((position) => position.y));
-  const maxX = Math.max(...positions.map((position) => position.x + canvasBounds.nodeWidth));
-  const maxY = Math.max(...positions.map((position) => position.y + canvasBounds.nodeHeight));
+  const minX = Math.min(...positions.map(({ position }) => position.x));
+  const minY = Math.min(...positions.map(({ position }) => position.y));
+  const maxX = Math.max(...positions.map(({ position, size }) => position.x + size.width));
+  const maxY = Math.max(...positions.map(({ position, size }) => position.y + size.height));
 
   return {
     x: minX - clusterPadding,
@@ -139,6 +170,14 @@ function pointInsideRect(point: { x: number; y: number }, rect: { x: number; y: 
 
 function cloneWorkspace(workspace: WorkspaceState): WorkspaceState {
   return JSON.parse(JSON.stringify(workspace)) as WorkspaceState;
+}
+
+function workspaceSummary(workspace: WorkspaceState) {
+  return `${workspace.model.nodes.length} nodes / ${workspace.model.edges.length} edges / ${workspace.model.clusters.length} clusters`;
+}
+
+function snapshotTimestamp() {
+  return new Date().toISOString();
 }
 
 function formatSecretEntry(entry: ArchitectureNode['secretEnv'][number]) {
@@ -220,9 +259,10 @@ export function App() {
   const [selectedNodeId, setSelectedNodeId] = useState(workspace.model.nodes[0]?.id ?? '');
   const [leftRailOpen, setLeftRailOpen] = useState(true);
   const [rightRailOpen, setRightRailOpen] = useState(true);
+  const [rightPanelTab, setRightPanelTab] = useState<'inspector' | 'history'>('inspector');
   const [leftRailWidth, setLeftRailWidth] = useState(380);
   const [rightRailWidth, setRightRailWidth] = useState(420);
-  const [exportMode, setExportMode] = useState<'yaml' | 'terraform'>('yaml');
+  const [exportMode, setExportMode] = useState<'selected-yaml' | 'yaml' | 'terraform'>('yaml');
   const [dockHeight, setDockHeight] = useState(320);
   const [selectedClusterId, setSelectedClusterId] = useState(workspace.model.clusters[0]?.id ?? '');
   const [libraryTab, setLibraryTab] = useState<'core' | 'custom'>('core');
@@ -234,6 +274,18 @@ export function App() {
   const [selectedTemplateId, setSelectedTemplateId] = useState(builtinGraphTemplates[0]?.id ?? '');
   const [templateSaveName, setTemplateSaveName] = useState('Current graph');
   const [templateSaveNotes, setTemplateSaveNotes] = useState('Saved from the current workspace.');
+  const [snapshots, setSnapshots] = useState<WorkspaceSnapshot[]>([]);
+  const [selectedSnapshotId, setSelectedSnapshotId] = useState('');
+  const [snapshotMessage, setSnapshotMessage] = useState('Snapshots capture the full graph, layout, clusters, and generated config state.');
+  const [actionStatus, setActionStatus] = useState('Graph editor ready');
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState('');
+  const [blueprintSettingsOpen, setBlueprintSettingsOpen] = useState(false);
+  const [clusterDefaultsOpen, setClusterDefaultsOpen] = useState(false);
+  const [simulationActive, setSimulationActive] = useState(false);
+  const [playPreviewOpen, setPlayPreviewOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [canvasConnectMode, setCanvasConnectMode] = useState(false);
   const [canvasViewport, setCanvasViewport] = useState({ x: 0, y: 0, scale: 1 });
   const [spacePressed, setSpacePressed] = useState(false);
@@ -260,25 +312,32 @@ export function App() {
   const edgeSequenceRef = useRef(0);
   const librarySequenceRef = useRef(0);
   const templateSequenceRef = useRef(0);
+  const snapshotSequenceRef = useRef(0);
+  const undoStackRef = useRef<WorkspaceState[]>([]);
+  const redoStackRef = useRef<WorkspaceState[]>([]);
 
   const model = workspace.model;
   const resolvedModel = useMemo(() => getResolvedModel(model), [model]);
   const layout = workspace.layout;
+  const nodeSizes = useMemo(() => new Map(resolvedModel.nodes.map((node) => [node.id, nodeSizeFor(node)])), [resolvedModel.nodes]);
   const virtualCanvas = useMemo(() => {
-    const positions = Object.values(layout);
-    if (positions.length === 0) {
+    const nodeExtents = resolvedModel.nodes
+      .map((node) => ({ position: layout[node.id], size: nodeSizes.get(node.id) ?? { width: canvasBounds.nodeWidth, height: canvasBounds.nodeHeight } }))
+      .filter((entry) => entry.position);
+    if (nodeExtents.length === 0) {
       return { width: canvasBounds.width, height: canvasBounds.height };
     }
 
-    const maxX = Math.max(...positions.map((position) => position.x + canvasBounds.nodeWidth + canvasBounds.padding));
-    const maxY = Math.max(...positions.map((position) => position.y + canvasBounds.nodeHeight + canvasBounds.padding));
+    const maxX = Math.max(...nodeExtents.map(({ position, size }) => position.x + size.width + canvasBounds.padding));
+    const maxY = Math.max(...nodeExtents.map(({ position, size }) => position.y + size.height + canvasBounds.padding));
     return {
       width: Math.max(canvasBounds.width, Math.ceil(maxX)),
       height: Math.max(canvasBounds.height, Math.ceil(maxY)),
     };
-  }, [layout]);
+  }, [layout, nodeSizes, resolvedModel.nodes]);
   const validationIssues = useMemo(() => validateArchitecture(model), [model]);
   const deploymentPlan = useMemo(() => generateDeploymentPlan(model), [model]);
+  const kubernetesDocuments = useMemo(() => generateKubernetesDocuments(model), [model]);
   const yamlOutput = useMemo(() => generateKubernetesYaml(model), [model]);
   const terraformOutput = useMemo(() => generateTerraform(model), [model]);
   const selectedNode = model.nodes.find((node) => node.id === selectedNodeId) ?? model.nodes[0];
@@ -298,19 +357,35 @@ export function App() {
       .filter((entry) => entry.decision.allowed);
   }, [edgeDraft.from, model.nodes]);
   const selectedNodeBehavior = selectedNode ? nodeBehaviorCopy[selectedNode.type] : '';
+  const selectedNodeDocuments = useMemo(
+    () => (selectedNode ? kubernetesDocuments.filter((document) => document.ownerNodeIds?.includes(selectedNode.id)) : []),
+    [kubernetesDocuments, selectedNode],
+  );
+  const selectedNodeYamlOutput = selectedNodeDocuments.map((document) => document.yaml).join('\n---\n');
+  const findResults = useMemo(() => {
+    const query = findQuery.trim().toLowerCase();
+    if (!query) {
+      return model.nodes.slice(0, 8);
+    }
+
+    return model.nodes
+      .filter((node) => [node.name, node.type, node.namespace, node.image, node.serviceAccountName].some((value) => value.toLowerCase().includes(query)))
+      .slice(0, 12);
+  }, [findQuery, model.nodes]);
   const activeLibraryItems = libraryTab === 'core' ? coreNodeLibrary : customNodeLibrary;
   const selectedLibraryItem = activeLibraryItems.find((item) => item.id === selectedLibraryItemId) ?? activeLibraryItems[0] ?? coreNodeLibrary[0];
   const activeGraphTemplates = templateTab === 'builtin' ? builtinGraphTemplates : customGraphTemplates;
   const selectedGraphTemplate = activeGraphTemplates.find((template) => template.id === selectedTemplateId) ?? activeGraphTemplates[0] ?? builtinGraphTemplates[0];
+  const selectedSnapshot = snapshots.find((snapshot) => snapshot.id === selectedSnapshotId) ?? snapshots[0];
 
   const clusterSummaries = useMemo(
     () =>
       model.clusters.map((cluster) => ({
         cluster,
-        bounds: clusterBounds(cluster, layout),
+        bounds: clusterBounds(cluster, layout, nodeSizes),
         nodes: model.nodes.filter((node) => cluster.nodeIds.includes(node.id)),
       })),
-    [layout, model.clusters, model.nodes],
+    [layout, model.clusters, model.nodes, nodeSizes],
   );
 
   useEffect(() => {
@@ -324,6 +399,23 @@ export function App() {
   useEffect(() => {
     saveCustomGraphTemplates(customGraphTemplates);
   }, [customGraphTemplates]);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadSnapshots().then((loadedSnapshots) => {
+      if (cancelled) {
+        return;
+      }
+      if (loadedSnapshots.length === 0) {
+        return;
+      }
+      setSnapshots(loadedSnapshots);
+      setSelectedSnapshotId(loadedSnapshots[0]?.id ?? '');
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     function handleWindowPointerMove(event: PointerEvent) {
@@ -388,6 +480,170 @@ export function App() {
         ...patch,
       },
     }));
+  }
+
+  function pushUndoState(previousWorkspace = workspace) {
+    undoStackRef.current = [...undoStackRef.current.slice(-24), cloneWorkspace(previousWorkspace)];
+    redoStackRef.current = [];
+  }
+
+  function replaceWorkspace(nextWorkspace: WorkspaceState, options: { trackUndo?: boolean; message?: string } = {}) {
+    if (options.trackUndo ?? true) {
+      pushUndoState(workspace);
+    }
+    setWorkspace(nextWorkspace);
+    setSelectedNodeId(nextWorkspace.model.nodes[0]?.id ?? '');
+    setSelectedClusterId(nextWorkspace.model.clusters[0]?.id ?? '');
+    setSnapshotMessage(options.message ?? `Loaded ${workspaceSummary(nextWorkspace)}.`);
+  }
+
+  function undoWorkspaceChange() {
+    const previous = undoStackRef.current.at(-1);
+    if (!previous) {
+      setSnapshotMessage('Nothing to undo.');
+      return;
+    }
+    undoStackRef.current = undoStackRef.current.slice(0, -1);
+    redoStackRef.current = [...redoStackRef.current.slice(-24), cloneWorkspace(workspace)];
+    setWorkspace(previous);
+    setSelectedNodeId(previous.model.nodes[0]?.id ?? '');
+    setSelectedClusterId(previous.model.clusters[0]?.id ?? '');
+    setSnapshotMessage('Restored previous workspace state from undo stack.');
+  }
+
+  function redoWorkspaceChange() {
+    const next = redoStackRef.current.at(-1);
+    if (!next) {
+      setSnapshotMessage('Nothing to redo.');
+      return;
+    }
+    redoStackRef.current = redoStackRef.current.slice(0, -1);
+    undoStackRef.current = [...undoStackRef.current.slice(-24), cloneWorkspace(workspace)];
+    setWorkspace(next);
+    setSelectedNodeId(next.model.nodes[0]?.id ?? '');
+    setSelectedClusterId(next.model.clusters[0]?.id ?? '');
+    setSnapshotMessage('Reapplied workspace state from redo stack.');
+  }
+
+  function createWorkspaceSnapshot(name = `Snapshot ${snapshots.length + 1}`) {
+    const createdAt = snapshotTimestamp();
+    const snapshotId = `snapshot-${createdAt.replace(/[^0-9]/g, '')}-${snapshotSequenceRef.current++}`;
+    const snapshot: WorkspaceSnapshot = {
+      id: snapshotId,
+      name,
+      createdAt,
+      summary: workspaceSummary(workspace),
+      workspace: cloneWorkspace(workspace),
+    };
+    const optimisticSnapshots = [snapshot, ...snapshots.filter((entry) => entry.id !== snapshot.id)].slice(0, 50);
+    setSnapshots(optimisticSnapshots);
+    setSelectedSnapshotId(snapshot.id);
+    setRightPanelTab('history');
+    setSnapshotMessage(`Saved ${snapshot.name}: ${snapshot.summary}.`);
+    void saveSnapshot(snapshot);
+  }
+
+  function restoreSelectedSnapshot() {
+    if (!selectedSnapshot) {
+      setSnapshotMessage('No snapshot selected.');
+      return;
+    }
+    replaceWorkspace(cloneWorkspace(selectedSnapshot.workspace), {
+      trackUndo: true,
+      message: `Restored ${selectedSnapshot.name}.`,
+    });
+    setRightPanelTab('history');
+  }
+
+  async function removeSelectedSnapshot() {
+    if (!selectedSnapshot) {
+      setSnapshotMessage('No snapshot selected.');
+      return;
+    }
+    const nextSnapshots = await deleteSnapshot(selectedSnapshot.id);
+    setSnapshots(nextSnapshots);
+    setSelectedSnapshotId(nextSnapshots[0]?.id ?? '');
+    setSnapshotMessage(`Deleted ${selectedSnapshot.name}.`);
+  }
+
+  function snapshotDiffSummary(snapshot?: WorkspaceSnapshot) {
+    if (!snapshot) {
+      return 'Select a snapshot to compare.';
+    }
+    const current = workspace;
+    const previous = snapshot.workspace;
+    return [
+      `Nodes ${previous.model.nodes.length} -> ${current.model.nodes.length}`,
+      `Edges ${previous.model.edges.length} -> ${current.model.edges.length}`,
+      `Clusters ${previous.model.clusters.length} -> ${current.model.clusters.length}`,
+      `Provider ${previous.model.provider} -> ${current.model.provider}`,
+      `Environment ${previous.model.activeEnvironment} -> ${current.model.activeEnvironment}`,
+    ].join(' | ');
+  }
+
+  function compileGraph() {
+    const errorCount = validationIssues.filter((issue) => issue.level === 'error').length;
+    const warningCount = validationIssues.filter((issue) => issue.level === 'warning').length;
+    setExportMode('yaml');
+    setDockHeight((height) => Math.max(height, 360));
+    setActionStatus(`Compile complete: ${errorCount} errors / ${warningCount} warnings. YAML preview refreshed.`);
+  }
+
+  function openFindCommand() {
+    setFindOpen(true);
+    setFindQuery(selectedNode?.name ?? '');
+    setActionStatus('Find ready: search nodes by name, type, namespace, image, or service account.');
+  }
+
+  function selectFoundNode(nodeId: string) {
+    setSelectedNodeId(nodeId);
+    setRightPanelTab('inspector');
+    setRightRailOpen(true);
+    setFindOpen(false);
+    setActionStatus(`Selected ${model.nodes.find((node) => node.id === nodeId)?.name ?? 'node'} from Find.`);
+  }
+
+  function handleActionBarCommand(label: string) {
+    switch (label) {
+      case 'Compile':
+        compileGraph();
+        break;
+      case 'Save':
+        createWorkspaceSnapshot('Manual save');
+        setActionStatus('Saved local workspace snapshot.');
+        break;
+      case 'Browse':
+        setTemplatesOpen(true);
+        setActionStatus('Template browser opened.');
+        break;
+      case 'Diff':
+        setRightPanelTab('history');
+        setRightRailOpen(true);
+        setSnapshotMessage(snapshotDiffSummary(selectedSnapshot));
+        setActionStatus('Diff compared current graph against the selected snapshot.');
+        break;
+      case 'Find':
+        openFindCommand();
+        break;
+      case 'Blueprint Settings':
+        setBlueprintSettingsOpen(true);
+        setActionStatus('Blueprint settings opened.');
+        break;
+      case 'Cluster Defaults':
+        setClusterDefaultsOpen(true);
+        setActionStatus('Cluster defaults opened.');
+        break;
+      case 'Simulate':
+        setSimulationActive((active) => !active);
+        setActionStatus(`${simulationActive ? 'Stopped' : 'Started'} request-flow simulation across ${model.edges.length} edges.`);
+        break;
+      case 'Play':
+        setPlayPreviewOpen(true);
+        setActionStatus('Live preview opened.');
+        break;
+      default:
+        break;
+    }
   }
 
   function updateCluster(clusterId: string, patch: Partial<Cluster>) {
@@ -491,8 +747,9 @@ export function App() {
   }
 
   function updateNodePosition(nodeId: string, x: number, y: number) {
-    const clampedX = clamp(x, 24, virtualCanvas.width - canvasBounds.nodeWidth - 24);
-    const clampedY = clamp(y, 24, virtualCanvas.height - canvasBounds.nodeHeight - 24);
+    const nodeSize = nodeSizes.get(nodeId) ?? { width: canvasBounds.nodeWidth, height: canvasBounds.nodeHeight };
+    const clampedX = clamp(x, 24, virtualCanvas.width - nodeSize.width - 24);
+    const clampedY = clamp(y, 24, virtualCanvas.height - nodeSize.height - 24);
 
     setWorkspace((current) => {
       const nextLayout = {
@@ -500,11 +757,11 @@ export function App() {
         [nodeId]: { x: clampedX, y: clampedY },
       };
       const center = {
-        x: clampedX + canvasBounds.nodeWidth / 2,
-        y: clampedY + canvasBounds.nodeHeight / 2,
+        x: clampedX + nodeSize.width / 2,
+        y: clampedY + nodeSize.height / 2,
       };
       const targetCluster = current.model.clusters.find((cluster) => {
-        const bounds = clusterBounds(cluster, nextLayout, nodeId);
+        const bounds = clusterBounds(cluster, nextLayout, nodeSizes, nodeId);
         return bounds ? pointInsideRect(center, bounds) : false;
       });
 
@@ -553,12 +810,13 @@ export function App() {
       for (const node of resolvedModel.nodes) {
         if (node.id === dragConnection.fromId) continue;
         const pos = layout[node.id];
+        const size = nodeSizes.get(node.id) ?? { width: canvasBounds.nodeWidth, height: canvasBounds.nodeHeight };
         if (!pos) continue;
         if (
           svgX >= pos.x &&
-          svgX <= pos.x + canvasBounds.nodeWidth &&
+          svgX <= pos.x + size.width &&
           svgY >= pos.y &&
-          svgY <= pos.y + canvasBounds.nodeHeight
+          svgY <= pos.y + size.height
         ) {
           hoveredNodeId = node.id;
           break;
@@ -685,8 +943,11 @@ export function App() {
     const nodeIdMap = new Map(source.model.nodes.map((node) => [node.id, `${node.id}-${suffix}`]));
     const clusterIdMap = new Map(source.model.clusters.map((cluster) => [cluster.id, `${cluster.id}-${suffix}`]));
     const existingPositions = Object.values(layout);
+    const existingNodesByPosition = model.nodes
+      .map((node) => ({ position: layout[node.id], size: nodeSizes.get(node.id) ?? { width: canvasBounds.nodeWidth, height: canvasBounds.nodeHeight } }))
+      .filter((entry) => entry.position);
     const offsetX = existingPositions.length > 0
-      ? Math.max(...existingPositions.map((position) => position.x + canvasBounds.nodeWidth)) + 180
+      ? Math.max(...existingNodesByPosition.map(({ position, size }) => position.x + size.width)) + 180
       : 120;
     const offsetY = 80;
 
@@ -725,17 +986,17 @@ export function App() {
   }
 
   function loadGraphTemplate(template: GraphTemplate, mode: 'replace' | 'merge') {
+    void createWorkspaceSnapshot(`Before template ${mode}`);
     if (mode === 'replace') {
       const nextWorkspace = cloneWorkspace(template.workspace);
-      setWorkspace(nextWorkspace);
-      setSelectedNodeId(nextWorkspace.model.nodes[0]?.id ?? '');
-      setSelectedClusterId(nextWorkspace.model.clusters[0]?.id ?? '');
+      replaceWorkspace(nextWorkspace, { trackUndo: true, message: `Loaded template ${template.name}.` });
       setCanvasViewport({ x: 0, y: 0, scale: 1 });
       setTemplatesOpen(false);
       return;
     }
 
     const incoming = templateWorkspaceForMerge(template);
+    pushUndoState(workspace);
     setWorkspace((current) => ({
       model: {
         ...current.model,
@@ -750,6 +1011,7 @@ export function App() {
     }));
     setSelectedNodeId(incoming.model.nodes[0]?.id ?? selectedNodeId);
     setSelectedClusterId(incoming.model.clusters[0]?.id ?? selectedClusterId);
+    setSnapshotMessage(`Merged template ${template.name} with offset.`);
     setTemplatesOpen(false);
   }
 
@@ -996,7 +1258,29 @@ export function App() {
     URL.revokeObjectURL(url);
   }
 
-  const exportText = exportMode === 'yaml' ? yamlOutput : terraformOutput;
+  async function copyText(content: string) {
+    if (!content) {
+      return;
+    }
+    if (navigator.clipboard) {
+      await navigator.clipboard.writeText(content);
+      return;
+    }
+
+    const textarea = document.createElement('textarea');
+    textarea.value = content;
+    textarea.setAttribute('readonly', 'true');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand('copy');
+    document.body.removeChild(textarea);
+  }
+
+  const selectedNodeExportFilename = selectedNode ? `${selectedNode.name.toLowerCase().replace(/[^a-z0-9]+/g, '-') || selectedNode.id}.yaml` : 'selected-node.yaml';
+  const exportText = exportMode === 'terraform' ? terraformOutput : exportMode === 'selected-yaml' ? selectedNodeYamlOutput : yamlOutput;
+  const exportLabel = exportMode === 'terraform' ? 'terraform export' : exportMode === 'selected-yaml' ? 'selected node yaml export' : 'yaml export';
 
   function handleCanvasWheel(event: React.WheelEvent<SVGSVGElement>) {
     event.preventDefault();
@@ -1048,10 +1332,12 @@ export function App() {
       }
 
       const point = clientPointToCanvas(canvasSvgRef.current, event.clientX, event.clientY);
+      const previewNode = createNodeTemplate(item.type, model.defaultNamespace);
+      const previewSize = nodeSizeFor({ ...previewNode, ...item.overrides });
       const position = Number.isFinite(point.x) && Number.isFinite(point.y)
         ? {
-            x: clamp(point.x - canvasBounds.nodeWidth / 2, 24, virtualCanvas.width - canvasBounds.nodeWidth - 24),
-            y: clamp(point.y - 36, 24, virtualCanvas.height - canvasBounds.nodeHeight - 24),
+            x: clamp(point.x - previewSize.width / 2, 24, virtualCanvas.width - previewSize.width - 24),
+            y: clamp(point.y - 36, 24, virtualCanvas.height - previewSize.height - 24),
           }
         : undefined;
       addNodeFromLibrary(item, position);
@@ -1065,16 +1351,18 @@ export function App() {
   }
 
   function fitCanvasToContent() {
-    const positions = Object.values(layout);
-    if (positions.length === 0) {
+    const extents = resolvedModel.nodes
+      .map((node) => ({ position: layout[node.id], size: nodeSizes.get(node.id) ?? { width: canvasBounds.nodeWidth, height: canvasBounds.nodeHeight } }))
+      .filter((entry) => entry.position);
+    if (extents.length === 0) {
       resetCanvasView();
       return;
     }
 
-    const minX = Math.min(...positions.map((position) => position.x));
-    const minY = Math.min(...positions.map((position) => position.y));
-    const maxX = Math.max(...positions.map((position) => position.x + canvasBounds.nodeWidth));
-    const maxY = Math.max(...positions.map((position) => position.y + canvasBounds.nodeHeight));
+    const minX = Math.min(...extents.map(({ position }) => position.x));
+    const minY = Math.min(...extents.map(({ position }) => position.y));
+    const maxX = Math.max(...extents.map(({ position, size }) => position.x + size.width));
+    const maxY = Math.max(...extents.map(({ position, size }) => position.y + size.height));
     const contentWidth = Math.max(maxX - minX, canvasBounds.nodeWidth);
     const contentHeight = Math.max(maxY - minY, canvasBounds.nodeHeight);
     const margin = 96;
@@ -1090,6 +1378,168 @@ export function App() {
       y: margin - minY * fitScale,
     });
   }
+
+  function autoLayoutGraph() {
+    const nextLayout = model.nodes.reduce<WorkspaceState['layout']>((next, node, index) => {
+      const column = index % 4;
+      const row = Math.floor(index / 4);
+      next[node.id] = {
+        x: 120 + column * (canvasBounds.maxNodeWidth + 90),
+        y: 120 + row * (canvasBounds.maxNodeHeight + 90),
+      };
+      return next;
+    }, {});
+
+    setWorkspace((current) => ({ ...current, layout: nextLayout }));
+    setActionStatus(`Auto-layout arranged ${model.nodes.length} nodes.`);
+  }
+
+  function handleMenuCommand(command: string) {
+    setOpenMenu(null);
+    switch (command) {
+      case 'new':
+        resetWorkspace();
+        setActionStatus('Started a new starter workspace.');
+        break;
+      case 'save':
+        handleActionBarCommand('Save');
+        break;
+      case 'import-yaml':
+        setActionStatus('Import YAML is queued for a future parser pass.');
+        break;
+      case 'export-zip':
+        void downloadBundle();
+        setActionStatus('Export ZIP started.');
+        break;
+      case 'undo':
+        undoWorkspaceChange();
+        break;
+      case 'redo':
+        redoWorkspaceChange();
+        break;
+      case 'find':
+        handleActionBarCommand('Find');
+        break;
+      case 'node-library':
+        setLeftRailOpen(true);
+        setLibraryTab('core');
+        setActionStatus('Node library focused in the Components rail.');
+        break;
+      case 'templates':
+        handleActionBarCommand('Browse');
+        break;
+      case 'fit':
+        fitCanvasToContent();
+        setActionStatus('Canvas fit to current graph content.');
+        break;
+      case 'zoom-100':
+        resetCanvasView();
+        setActionStatus('Canvas zoom reset to 100%.');
+        break;
+      case 'toggle-palette':
+        setLeftRailOpen((value) => !value);
+        setActionStatus(`${leftRailOpen ? 'Hid' : 'Showed'} Components palette.`);
+        break;
+      case 'toggle-inspector':
+        setRightRailOpen((value) => !value);
+        setActionStatus(`${rightRailOpen ? 'Hid' : 'Showed'} Inspector.`);
+        break;
+      case 'toggle-dock':
+        setDockHeight((height) => (height <= 64 ? 320 : 48));
+        setActionStatus('Toggled output dock height.');
+        break;
+      case 'validate':
+      case 'compile':
+        handleActionBarCommand('Compile');
+        break;
+      case 'auto-layout':
+        autoLayoutGraph();
+        break;
+      case 'detect-pattern':
+        setActionStatus(`Detected graph pattern: ${detectPattern(model)}.`);
+        break;
+      case 'edge-filters':
+        setActionStatus('Edge filters are queued for a later graph filtering pass.');
+        break;
+      case 'simulate':
+        handleActionBarCommand('Simulate');
+        break;
+      case 'diff':
+        handleActionBarCommand('Diff');
+        break;
+      case 'docs':
+        setActionStatus('Generate docs is queued for a later documentation export pass.');
+        break;
+      case 'shortcuts':
+      case 'about':
+        setHelpOpen(true);
+        break;
+      default:
+        break;
+    }
+  }
+
+  const menuGroups = [
+    {
+      label: 'File',
+      commands: [
+        { label: 'New', command: 'new' },
+        { label: 'Save Snapshot', command: 'save' },
+        { label: 'Import YAML', command: 'import-yaml' },
+        { label: 'Export ZIP', command: 'export-zip' },
+      ],
+    },
+    {
+      label: 'Edit',
+      commands: [
+        { label: 'Undo', command: 'undo' },
+        { label: 'Redo', command: 'redo' },
+        { label: 'Find', command: 'find' },
+      ],
+    },
+    {
+      label: 'Asset',
+      commands: [
+        { label: 'Node Library', command: 'node-library' },
+        { label: 'Templates', command: 'templates' },
+      ],
+    },
+    {
+      label: 'View',
+      commands: [
+        { label: 'Fit to Content', command: 'fit' },
+        { label: 'Zoom 100%', command: 'zoom-100' },
+        { label: leftRailOpen ? 'Hide Palette' : 'Show Palette', command: 'toggle-palette' },
+        { label: rightRailOpen ? 'Hide Inspector' : 'Show Inspector', command: 'toggle-inspector' },
+        { label: 'Toggle Dock', command: 'toggle-dock' },
+      ],
+    },
+    {
+      label: 'Graph',
+      commands: [
+        { label: 'Validate', command: 'validate' },
+        { label: 'Auto-layout', command: 'auto-layout' },
+        { label: 'Detect Pattern', command: 'detect-pattern' },
+        { label: 'Edge Filters', command: 'edge-filters' },
+      ],
+    },
+    {
+      label: 'Tools',
+      commands: [
+        { label: 'Compile', command: 'compile' },
+        { label: 'Simulate', command: 'simulate' },
+        { label: 'Diff', command: 'diff' },
+        { label: 'Generate Docs', command: 'docs' },
+      ],
+    },
+    {
+      label: 'Help',
+      commands: [
+        { label: 'Shortcuts', command: 'shortcuts' },
+        { label: 'About', command: 'about' },
+      ],
+    },
+  ];
 
   function startHandleConnection(nodeId: string, event: React.PointerEvent<SVGCircleElement>) {
     const svgEl = event.currentTarget.ownerSVGElement;
@@ -1121,10 +1571,27 @@ export function App() {
             <span className="editor-brand-text">Visual Kubernetes</span>
           </div>
           <nav className="editor-menu-items" aria-label="Editor menu">
-            {editorMenus.map((item) => (
-              <button key={item.label} type="button" className="menu-button" title={item.commands}>
-                {item.label}
-              </button>
+            {menuGroups.map((item) => (
+              <div key={item.label} className="menu-group">
+                <button
+                  type="button"
+                  className={openMenu === item.label ? 'menu-button active' : 'menu-button'}
+                  aria-haspopup="menu"
+                  aria-expanded={openMenu === item.label}
+                  onClick={() => setOpenMenu((current) => (current === item.label ? null : item.label))}
+                >
+                  {item.label}
+                </button>
+                {openMenu === item.label && (
+                  <div className="menu-dropdown" role="menu" aria-label={`${item.label} menu`}>
+                    {item.commands.map((command) => (
+                      <button key={command.command} type="button" role="menuitem" onClick={() => handleMenuCommand(command.command)}>
+                        {command.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             ))}
           </nav>
           <div className="editor-context">
@@ -1141,7 +1608,7 @@ export function App() {
                 className="chrome-button command-button"
                 title={item.intent}
                 aria-label={item.label}
-                onClick={item.label === 'Browse' ? () => setTemplatesOpen(true) : undefined}
+                onClick={() => handleActionBarCommand(item.label)}
               >
                 <span className="command-icon" aria-hidden="true">{item.icon}</span>
                 <span>{item.label}</span>
@@ -1162,30 +1629,38 @@ export function App() {
             ))}
           </div>
           <div className="editor-action-group">
-            <button type="button" className="chrome-button command-button active" title="Edit per-cluster defaults once clusters exist" aria-label="Cluster Defaults">
+            <button
+              type="button"
+              className={clusterDefaultsOpen ? 'chrome-button command-button active' : 'chrome-button command-button'}
+              title="Edit per-cluster defaults once clusters exist"
+              aria-label="Cluster Defaults"
+              onClick={() => handleActionBarCommand('Cluster Defaults')}
+            >
               <span className="command-icon" aria-hidden="true">CL</span>
               <span>Cluster Defaults</span>
             </button>
-            <button type="button" className="chrome-button command-button" title="Animate traffic and failure behavior across graph edges" aria-label="Simulate">
+            <button
+              type="button"
+              className={simulationActive ? 'chrome-button command-button active' : 'chrome-button command-button'}
+              title="Animate traffic and failure behavior across graph edges"
+              aria-label="Simulate"
+              onClick={() => handleActionBarCommand('Simulate')}
+            >
               <span className="command-icon" aria-hidden="true">SIM</span>
               <span>Simulate</span>
             </button>
-            <button type="button" className="chrome-button command-button" title="Open read-only live preview output with diff markers" aria-label="Play">
+            <button
+              type="button"
+              className={playPreviewOpen ? 'chrome-button command-button active' : 'chrome-button command-button'}
+              title="Open read-only live preview output with diff markers"
+              aria-label="Play"
+              onClick={() => handleActionBarCommand('Play')}
+            >
               <span className="command-icon" aria-hidden="true">RUN</span>
               <span>Play</span>
             </button>
           </div>
-        </div>
-
-        <div className="editor-tabbar">
-          <div className="editor-tab-track">
-            {workbenchTabs.map((tab, index) => (
-              <button key={tab} type="button" className={index === 1 ? 'workspace-tab active' : 'workspace-tab'}>
-                {tab}
-              </button>
-            ))}
-          </div>
-          <div className="editor-top-status">{model.activeEnvironment} environment active</div>
+          <div className="editor-top-status">{actionStatus}</div>
         </div>
       </header>
 
@@ -1465,16 +1940,17 @@ export function App() {
           </div>
         )}
       </aside>
-      {leftRailOpen && (
-        <div
-          className="side-resizer"
-          onPointerDown={(event) => {
-            leftRailResizeRef.current = { startX: event.clientX, startWidth: leftRailWidth };
-            event.currentTarget.setPointerCapture(event.pointerId);
-          }}
-          aria-label="Resize left panel"
-        />
-      )}
+      <div
+        className={leftRailOpen ? 'side-resizer' : 'side-resizer disabled'}
+        onPointerDown={(event) => {
+          if (!leftRailOpen) {
+            return;
+          }
+          leftRailResizeRef.current = { startX: event.clientX, startWidth: leftRailWidth };
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        aria-label="Resize left panel"
+      />
 
       <main className="main-surface">
         <div className="toolbar">
@@ -1565,7 +2041,8 @@ export function App() {
                 return null;
               }
 
-              const x1 = from.x + canvasBounds.nodeWidth - nodePortInset;
+              const fromSize = nodeSizes.get(edge.from) ?? { width: canvasBounds.nodeWidth, height: canvasBounds.nodeHeight };
+              const x1 = from.x + fromSize.width - nodePortInset;
               const y1 = from.y + nodePortOffsetY;
               const x2 = to.x + nodePortInset;
               const y2 = to.y + nodePortOffsetY;
@@ -1581,6 +2058,7 @@ export function App() {
                     stroke={edge.networkPolicy === 'deny' ? '#ff6b6b' : 'url(#edgeGlow)'}
                     strokeWidth="3"
                     fill="none"
+                    className={simulationActive ? 'edge-path simulating' : 'edge-path'}
                     strokeDasharray={crossCluster ? '16 8' : edge.networkPolicy === 'deny' ? '2 8' : edge.type === 'async' ? '12 6' : edge.type === 'data' ? '4 4' : undefined}
                   />
                   <text x={(x1 + x2) / 2} y={Math.min(y1, y2) - 10} textAnchor="middle" className="edge-label">
@@ -1599,8 +2077,9 @@ export function App() {
                 const hoveredNode = dragConnection.hoveredNodeId ? resolvedModel.nodes.find((n) => n.id === dragConnection.hoveredNodeId) : null;
                 const hoveredPos = dragConnection.hoveredNodeId ? layout[dragConnection.hoveredNodeId] : null;
                 const isValidTarget = fromNode && hoveredNode ? canConnectNodes(fromNode, hoveredNode).allowed : false;
+                const fromSize = nodeSizes.get(dragConnection.fromId) ?? { width: canvasBounds.nodeWidth, height: canvasBounds.nodeHeight };
 
-                const x1 = from.x + canvasBounds.nodeWidth - nodePortInset;
+                const x1 = from.x + fromSize.width - nodePortInset;
                 const y1 = from.y + nodePortOffsetY;
                 const x2 = isValidTarget && hoveredPos ? hoveredPos.x + nodePortInset : dragConnection.x;
                 const y2 = isValidTarget && hoveredPos ? hoveredPos.y + nodePortOffsetY : dragConnection.y;
@@ -1665,7 +2144,10 @@ export function App() {
               }
 
               const nodeKindLabel = node.type.toUpperCase();
-              const runtimeLabel = `${node.image}:${node.tag}`;
+              const nodeSize = nodeSizes.get(node.id) ?? { width: canvasBounds.nodeWidth, height: canvasBounds.nodeHeight };
+              const runtimeLabel = nodeRuntimeLabel(node);
+              const textWidth = nodeSize.width - 32;
+              const headerNameWidth = nodeSize.width - estimateTextWidth(nodeKindLabel, 6.4) - 48;
               const pinTargetLabel =
                 node.type === 'database' || node.type === 'cache'
                   ? 'storage'
@@ -1722,37 +2204,37 @@ export function App() {
                     y={position.y}
                     rx="8"
                     ry="8"
-                    width={canvasBounds.nodeWidth}
-                    height={canvasBounds.nodeHeight}
+                    width={nodeSize.width}
+                    height={nodeSize.height}
                     fill={selected ? '#1b1d22' : '#17191d'}
                     stroke={borderColor}
                     strokeWidth={borderWidth}
                   />
-                  <rect x={position.x} y={position.y} rx="8" ry="8" width={canvasBounds.nodeWidth} height="6" fill={headerColor} />
-                  <rect x={position.x + 1} y={position.y + 8} rx="6" ry="6" width={canvasBounds.nodeWidth - 2} height="28" fill="#101216" />
-                  <rect x={position.x + 1} y={position.y + 42} width={canvasBounds.nodeWidth - 2} height="1" fill="#2b3038" />
-                  <text x={position.x + 16} y={position.y + 28} className="node-header-text">
+                  <rect x={position.x} y={position.y} rx="8" ry="8" width={nodeSize.width} height="6" fill={headerColor} />
+                  <rect x={position.x + 1} y={position.y + 8} rx="6" ry="6" width={nodeSize.width - 2} height="28" fill="#101216" />
+                  <rect x={position.x + 1} y={position.y + 42} width={nodeSize.width - 2} height="1" fill="#2b3038" />
+                  <text x={position.x + 16} y={position.y + 28} className="node-header-text" textLength={fitTextLength(node.name, headerNameWidth, 7.2)}>
                     {node.name}
                   </text>
-                  <text x={position.x + canvasBounds.nodeWidth - 16} y={position.y + 28} textAnchor="end" className="node-kind-text">
+                  <text x={position.x + nodeSize.width - 16} y={position.y + 28} textAnchor="end" className="node-kind-text">
                     {nodeKindLabel}
                   </text>
                   <text x={position.x + 26} y={position.y + 60} className="node-pin-label">
                     {pinTargetLabel}
                   </text>
-                  <text x={position.x + canvasBounds.nodeWidth - 26} y={position.y + 60} textAnchor="end" className="node-pin-label">
+                  <text x={position.x + nodeSize.width - 26} y={position.y + 60} textAnchor="end" className="node-pin-label">
                     {pinSourceLabel}
                   </text>
-                  <text x={position.x + 16} y={position.y + 86} className="node-meta">
+                  <text x={position.x + 16} y={position.y + 86} className="node-meta" textLength={fitTextLength(runtimeLabel, textWidth, 6.2)}>
                     {runtimeLabel}
                   </text>
-                  <text x={position.x + 16} y={position.y + 106} className="node-meta">
+                  <text x={position.x + 16} y={position.y + 106} className="node-meta" textLength={fitTextLength(`ns ${node.namespace} | ${node.workload.kind}`, textWidth, 6.2)}>
                     ns {node.namespace} | {node.workload.kind}
                   </text>
-                  <text x={position.x + 16} y={position.y + 126} className="node-meta">
+                  <text x={position.x + 16} y={position.y + 126} className="node-meta" textLength={fitTextLength(`sa ${node.serviceAccountName}`, textWidth, 6.2)}>
                     sa {node.serviceAccountName}
                   </text>
-                  <text x={position.x + 16} y={position.y + 144} className="node-footer-text">
+                  <text x={position.x + 16} y={position.y + nodeSize.height - 10} className="node-footer-text">
                     rep {node.replicas} | port {node.containerPort}
                   </text>
                   <circle
@@ -1765,7 +2247,7 @@ export function App() {
                     className={inputPortClass}
                   />
                   <circle
-                    cx={position.x + canvasBounds.nodeWidth - nodePortInset}
+                    cx={position.x + nodeSize.width - nodePortInset}
                     cy={position.y + nodePortOffsetY}
                     r="6"
                     fill={isDragSource ? '#74c0fc' : headerColor}
@@ -1791,27 +2273,58 @@ export function App() {
             aria-label="Resize export panel"
           />
           <div className="dock-tabs">
+            <button
+              type="button"
+              className={exportMode === 'selected-yaml' ? 'tab active' : 'tab'}
+              onClick={() => setExportMode('selected-yaml')}
+            >
+              Selected node YAML
+            </button>
             <button type="button" className={exportMode === 'yaml' ? 'tab active' : 'tab'} onClick={() => setExportMode('yaml')}>
-              Kubernetes YAML
+              Full stack YAML
             </button>
             <button type="button" className={exportMode === 'terraform' ? 'tab active' : 'tab'} onClick={() => setExportMode('terraform')}>
               Terraform
             </button>
             <div className="dock-actions">
-              <button type="button" className="icon-button" onClick={() => downloadSingleFile('manifests.yaml', yamlOutput)}>
-                Download YAML
-              </button>
-              <button type="button" className="icon-button" onClick={() => downloadSingleFile('main.tf', terraformOutput)}>
-                Download Terraform
-              </button>
-              <button type="button" className="primary-button" onClick={downloadBundle}>
-                Download ZIP
-              </button>
+              {exportMode === 'selected-yaml' ? (
+                <>
+                  <button type="button" className="icon-button" disabled={!selectedNodeYamlOutput} onClick={() => void copyText(selectedNodeYamlOutput)}>
+                    Copy selected
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-button"
+                    disabled={!selectedNodeYamlOutput}
+                    onClick={() => downloadSingleFile(selectedNodeExportFilename, selectedNodeYamlOutput)}
+                  >
+                    Download selected
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button type="button" className="icon-button" onClick={() => downloadSingleFile('manifests.yaml', yamlOutput)}>
+                    Download YAML
+                  </button>
+                  <button type="button" className="icon-button" onClick={() => downloadSingleFile('main.tf', terraformOutput)}>
+                    Download Terraform
+                  </button>
+                  <button type="button" className="primary-button" onClick={downloadBundle}>
+                    Download ZIP
+                  </button>
+                </>
+              )}
             </div>
           </div>
-          <pre className="export-preview" aria-label={`${exportMode} export`}>
-            <code>{exportText}</code>
-          </pre>
+          {exportMode === 'selected-yaml' && !selectedNodeYamlOutput ? (
+            <div className="export-placeholder" aria-label="selected node yaml export">
+              Select a node with generated Kubernetes resources to preview node-scoped YAML.
+            </div>
+          ) : (
+            <pre className="export-preview" aria-label={exportLabel}>
+              <code>{exportText}</code>
+            </pre>
+          )}
         </section>
       </main>
 
@@ -1832,8 +2345,87 @@ export function App() {
             {rightRailOpen ? 'Hide' : 'Show'}
           </button>
         </div>
-        {rightRailOpen && selectedNode && selectedNodeResolved && (
+        {rightRailOpen && (
           <div className="rail-content inspector-content">
+            <div className="library-tabs" aria-label="Right panel tabs">
+              <button type="button" className={rightPanelTab === 'inspector' ? 'mini-tab active' : 'mini-tab'} onClick={() => setRightPanelTab('inspector')}>
+                Inspector
+              </button>
+              <button type="button" className={rightPanelTab === 'history' ? 'mini-tab active' : 'mini-tab'} onClick={() => setRightPanelTab('history')}>
+                History
+              </button>
+            </div>
+            {rightPanelTab === 'history' ? (
+              <>
+                <div className="section-card">
+                  <div className="section-title">Snapshots</div>
+                  <div className="mini-metrics">
+                    <span>{snapshots.length} saved</span>
+                    <span>{workspaceSummary(workspace)}</span>
+                  </div>
+                  <div className="status-chip neutral">{snapshotMessage}</div>
+                  <div className="quick-actions">
+                    <button type="button" className="primary-button" onClick={() => void createWorkspaceSnapshot('Manual save')}>
+                      Save snapshot
+                    </button>
+                    <button type="button" className="ghost-button" onClick={undoWorkspaceChange}>
+                      Undo
+                    </button>
+                    <button type="button" className="ghost-button" onClick={redoWorkspaceChange}>
+                      Redo
+                    </button>
+                  </div>
+                </div>
+                <div className="section-card">
+                  <div className="section-title">Timeline</div>
+                  <div className="snapshot-list" aria-label="Snapshot timeline">
+                    {snapshots.length > 0 ? (
+                      snapshots.map((snapshot) => (
+                        <button
+                          key={snapshot.id}
+                          type="button"
+                          className={snapshot.id === selectedSnapshot?.id ? 'snapshot-item active' : 'snapshot-item'}
+                          onClick={() => setSelectedSnapshotId(snapshot.id)}
+                        >
+                          <strong>{snapshot.name}</strong>
+                          <span>{snapshot.summary}</span>
+                          <small>{new Date(snapshot.createdAt).toLocaleString()}</small>
+                        </button>
+                      ))
+                    ) : (
+                      <div className="node-type-description">No snapshots yet. Use Save in the action bar or Save snapshot here.</div>
+                    )}
+                  </div>
+                </div>
+                <div className="section-card">
+                  <div className="section-title">Selected snapshot</div>
+                  {selectedSnapshot ? (
+                    <>
+                      <div className="selected-name">{selectedSnapshot.name}</div>
+                      <div className="selected-subtle">
+                        <span>{selectedSnapshot.summary}</span>
+                        <span>{new Date(selectedSnapshot.createdAt).toLocaleString()}</span>
+                      </div>
+                      <div className="behavior-card">
+                        <strong>Diff</strong>
+                        <span>{snapshotDiffSummary(selectedSnapshot)}</span>
+                      </div>
+                      <div className="quick-actions">
+                        <button type="button" className="primary-button" onClick={restoreSelectedSnapshot}>
+                          Restore snapshot
+                        </button>
+                        <button type="button" className="danger-button" onClick={() => void removeSelectedSnapshot()}>
+                          Delete snapshot
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="node-type-description">Select or create a snapshot to restore, delete, or compare.</div>
+                  )}
+                </div>
+              </>
+            ) : selectedNode && selectedNodeResolved ? (
+              <>
             <div className="section-card compact">
               <div className="section-title">Selected</div>
               <div className="selected-name">{selectedNodeResolved.name}</div>
@@ -2789,10 +3381,192 @@ export function App() {
                 Delete node
               </button>
             </div>
+              </>
+            ) : (
+              <div className="section-card">
+                <div className="section-title">Inspector</div>
+                <div className="node-type-description">Select a node to inspect runtime, networking, resources, and validation settings.</div>
+              </div>
+            )}
           </div>
         )}
       </aside>
       </div>
+      {findOpen && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Find nodes">
+          <div className="command-modal">
+            <div className="modal-header">
+              <div>
+                <div className="section-title">Find</div>
+                <h2>Search graph</h2>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setFindOpen(false)}>
+                Close
+              </button>
+            </div>
+            <label>
+              Node search
+              <input autoFocus value={findQuery} onChange={(event) => setFindQuery(event.target.value)} placeholder="service, namespace, image, account..." />
+            </label>
+            <div className="command-list" aria-label="Find results">
+              {findResults.length > 0 ? (
+                findResults.map((node) => (
+                  <button key={node.id} type="button" className="command-list-item" onClick={() => selectFoundNode(node.id)}>
+                    <strong>{node.name}</strong>
+                    <span>{node.type} | ns {node.namespace} | {node.image}:{node.tag}</span>
+                  </button>
+                ))
+              ) : (
+                <div className="node-type-description">No nodes match that search.</div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+      {blueprintSettingsOpen && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Blueprint settings">
+          <div className="command-modal">
+            <div className="modal-header">
+              <div>
+                <div className="section-title">Blueprint Settings</div>
+                <h2>Stack defaults</h2>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setBlueprintSettingsOpen(false)}>
+                Close
+              </button>
+            </div>
+            <div className="field-grid">
+              <label>
+                Stack name
+                <input value={model.name} onChange={(event) => updateModel({ name: event.target.value })} />
+              </label>
+              <label>
+                Default namespace
+                <input value={model.defaultNamespace} onChange={(event) => updateModel({ defaultNamespace: event.target.value })} />
+              </label>
+              <label>
+                Provider
+                <select value={model.provider} onChange={(event) => updateModel({ provider: event.target.value as CloudProvider })}>
+                  <option value="aws">AWS</option>
+                  <option value="gcp">GCP</option>
+                  <option value="azure">Azure</option>
+                  <option value="generic">Generic</option>
+                </select>
+              </label>
+              <label>
+                Environment
+                <select value={model.activeEnvironment} onChange={(event) => updateModel({ activeEnvironment: event.target.value as EnvironmentName })}>
+                  {supportedEnvironments.map((environment) => (
+                    <option key={environment} value={environment}>{environmentLabel(environment)}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="status-chip neutral">Blueprint defaults flow into generated YAML, Terraform, templates, snapshots, and exports.</div>
+          </div>
+        </div>
+      )}
+      {clusterDefaultsOpen && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Cluster defaults">
+          <div className="command-modal">
+            <div className="modal-header">
+              <div>
+                <div className="section-title">Cluster Defaults</div>
+                <h2>Cluster profile</h2>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setClusterDefaultsOpen(false)}>
+                Close
+              </button>
+            </div>
+            {selectedCluster ? (
+              <>
+                <div className="field-grid">
+                  <label>
+                    Cluster
+                    <select value={selectedCluster.id} onChange={(event) => setSelectedClusterId(event.target.value)}>
+                      {model.clusters.map((cluster) => (
+                        <option key={cluster.id} value={cluster.id}>{cluster.name}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Name
+                    <input value={selectedCluster.name} onChange={(event) => updateCluster(selectedCluster.id, { name: event.target.value })} />
+                  </label>
+                  <label>
+                    Provider
+                    <select value={selectedCluster.provider} onChange={(event) => updateCluster(selectedCluster.id, { provider: event.target.value as CloudProvider })}>
+                      <option value="aws">AWS</option>
+                      <option value="gcp">GCP</option>
+                      <option value="azure">Azure</option>
+                      <option value="generic">Generic</option>
+                    </select>
+                  </label>
+                  <label>
+                    Region
+                    <input value={selectedCluster.region} onChange={(event) => updateCluster(selectedCluster.id, { region: event.target.value })} />
+                  </label>
+                  <label>
+                    Worker count
+                    <input
+                      type="number"
+                      min="1"
+                      value={selectedCluster.workerCount}
+                      onChange={(event) => updateCluster(selectedCluster.id, { workerCount: Number(event.target.value) })}
+                    />
+                  </label>
+                </div>
+                <div className="status-chip neutral">{selectedCluster.nodeIds.length} nodes assigned to this cluster.</div>
+              </>
+            ) : (
+              <button type="button" className="primary-button" onClick={addCluster}>Add first cluster</button>
+            )}
+          </div>
+        </div>
+      )}
+      {playPreviewOpen && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Live preview">
+          <div className="template-modal">
+            <div className="modal-header">
+              <div>
+                <div className="section-title">Play</div>
+                <h2>Live preview</h2>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setPlayPreviewOpen(false)}>
+                Close
+              </button>
+            </div>
+            <div className="mini-metrics">
+              <span>{model.nodes.length} nodes</span>
+              <span>{model.edges.length} edges</span>
+              <span>{validationIssues.filter((issue) => issue.level === 'error').length} errors</span>
+              <span>{validationIssues.filter((issue) => issue.level === 'warning').length} warnings</span>
+            </div>
+            <pre className="export-preview live-preview" aria-label="live preview yaml">
+              <code>{yamlOutput}</code>
+            </pre>
+          </div>
+        </div>
+      )}
+      {helpOpen && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Help">
+          <div className="command-modal">
+            <div className="modal-header">
+              <div>
+                <div className="section-title">Help</div>
+                <h2>Visual Kubernetes shortcuts</h2>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setHelpOpen(false)}>
+                Close
+              </button>
+            </div>
+            <div className="section-card compact">
+              <div className="node-type-description">Mouse wheel zooms the canvas. Drag the background to pan. Drag node ports to create valid Kubernetes-aware links.</div>
+              <div className="node-type-description">Top menus mirror key toolbar actions and provide overflow space as the tool grows.</div>
+            </div>
+          </div>
+        </div>
+      )}
       {templatesOpen && (
         <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Template browser">
           <div className="template-modal">

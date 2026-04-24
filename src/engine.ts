@@ -1019,11 +1019,11 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
 
   for (const node of resolvedModel.nodes) {
     if (node.type === 'networkPolicy') {
-      documents.push(explicitNetworkPolicyDocument(node));
+      documents.push({ ...explicitNetworkPolicyDocument(node), ownerNodeIds: [node.id] });
       continue;
     }
     if (node.type === 'role') {
-      documents.push(...explicitRoleDocuments(node));
+      documents.push(...explicitRoleDocuments(node).map((document) => ({ ...document, ownerNodeIds: [node.id] })));
       continue;
     }
 
@@ -1038,6 +1038,7 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
     documents.push({
       kind: 'ServiceAccount',
       name: `${namespace}-${node.serviceAccountName}`,
+      ownerNodeIds: [node.id],
       yaml: ['apiVersion: v1', 'kind: ServiceAccount', 'metadata:', `  name: ${node.serviceAccountName}`, `  namespace: ${namespace}`].join('\n'),
     });
 
@@ -1046,6 +1047,7 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
       documents.push({
         kind: 'Role',
         name: `${namespace}-${roleName(node)}`,
+        ownerNodeIds: [node.id],
         yaml: [
           'apiVersion: rbac.authorization.k8s.io/v1',
           'kind: Role',
@@ -1067,6 +1069,7 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
       documents.push({
         kind: 'RoleBinding',
         name: `${namespace}-${roleName(node)}`,
+        ownerNodeIds: [node.id],
         yaml: [
           'apiVersion: rbac.authorization.k8s.io/v1',
           'kind: RoleBinding',
@@ -1089,6 +1092,7 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
       documents.push({
         kind: 'ConfigMap',
         name: `${namespace}-${envConfigMapName(node)}`,
+        ownerNodeIds: [node.id],
         yaml: [
           'apiVersion: v1',
           'kind: ConfigMap',
@@ -1105,6 +1109,7 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
       documents.push({
         kind: 'Secret',
         name: `${namespace}-${envSecretName(node)}`,
+        ownerNodeIds: [node.id],
         yaml: [
           'apiVersion: v1',
           'kind: Secret',
@@ -1265,12 +1270,13 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
 
     const workloadLines = workloadKind === 'Job' || workloadKind === 'CronJob' ? jobWorkloadLines : controllerWorkloadLines;
 
-    documents.push({ kind: workloadKind, name: `${namespace}-${appName}`, yaml: workloadLines.join('\n') });
+    documents.push({ kind: workloadKind, name: `${namespace}-${appName}`, ownerNodeIds: [node.id], yaml: workloadLines.join('\n') });
 
     if (node.storage.enabled && !shouldUseVolumeClaimTemplate(node)) {
       documents.push({
         kind: 'PersistentVolumeClaim',
         name: `${namespace}-${appName}-pvc`,
+        ownerNodeIds: [node.id],
         yaml: [
           'apiVersion: v1',
           'kind: PersistentVolumeClaim',
@@ -1288,6 +1294,7 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
       documents.push({
         kind: 'Service',
         name: `${namespace}-${appName}`,
+        ownerNodeIds: [node.id],
         yaml: [
           'apiVersion: v1',
           'kind: Service',
@@ -1344,13 +1351,14 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
         '                  number: 80',
       );
 
-      documents.push({ kind: 'Ingress', name: `${namespace}-${appName}`, yaml: ingressLines.join('\n') });
+      documents.push({ kind: 'Ingress', name: `${namespace}-${appName}`, ownerNodeIds: [node.id], yaml: ingressLines.join('\n') });
     }
 
     if (shouldEmitHpa(node)) {
       documents.push({
         kind: 'HorizontalPodAutoscaler',
         name: `${namespace}-${appName}`,
+        ownerNodeIds: [node.id],
         yaml: [
           'apiVersion: autoscaling/v2',
           'kind: HorizontalPodAutoscaler',
@@ -1434,6 +1442,7 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
     documents.push({
       kind: 'NetworkPolicy',
       name: `${toNs}-${policyName}`,
+      ownerNodeIds: [toNode.id],
       yaml: [
         'apiVersion: networking.k8s.io/v1',
         'kind: NetworkPolicy',

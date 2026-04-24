@@ -64,6 +64,17 @@ describe('architecture engine', () => {
     expect(yaml).toContain('name: ghcr-pull-secret');
   });
 
+  it('tags generated kubernetes documents with owning node ids for scoped previews', () => {
+    const documents = generateKubernetesDocuments(starterArchitecture);
+    const checkoutDocuments = documents.filter((document) => document.ownerNodeIds?.includes('service-checkout'));
+
+    expect(checkoutDocuments.map((document) => document.kind)).toEqual(
+      expect.arrayContaining(['ServiceAccount', 'Deployment', 'Service', 'HorizontalPodAutoscaler', 'NetworkPolicy']),
+    );
+    expect(checkoutDocuments.some((document) => document.name === 'inventory-inventory-service')).toBe(false);
+    expect(documents.find((document) => document.kind === 'Namespace')?.ownerNodeIds).toBeUndefined();
+  });
+
   it('exports terraform manifests for the kubernetes provider', () => {
     const terraform = generateTerraform(starterArchitecture);
 

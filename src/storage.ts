@@ -16,11 +16,15 @@ import type {
   Cluster,
   GraphTemplate,
   NodeLibraryItem,
+  WorkspaceSnapshot,
 } from './types';
 
 export const WORKSPACE_STORAGE_KEY = 'visual-kubernetes/workspace';
 export const NODE_LIBRARY_STORAGE_KEY = 'visual-kubernetes/node-library/custom';
 export const GRAPH_TEMPLATE_STORAGE_KEY = 'visual-kubernetes/templates/custom';
+export const SNAPSHOT_STORAGE_KEY = 'visual-kubernetes/snapshots/fallback';
+const SNAPSHOT_DB_NAME = 'visual-kubernetes';
+const SNAPSHOT_STORE_NAME = 'snapshots';
 
 function defaultProbeForNode(node: ArchitectureNode, label: 'readiness' | 'liveness' | 'startup', port: number): ProbeConfig {
   const probeType = node.type === 'database' || node.type === 'queue' || node.type === 'cache' ? 'tcp' : 'http';
@@ -323,4 +327,92 @@ export function saveCustomGraphTemplates(templates: GraphTemplate[]) {
   }
 
   window.localStorage.setItem(GRAPH_TEMPLATE_STORAGE_KEY, JSON.stringify(templates));
+}
+
+function loadSnapshotFallback(): WorkspaceSnapshot[] {
+  if (typeof window === 'undefined') {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(SNAPSHOT_STORAGE_KEY) ?? '[]') as WorkspaceSnapshot[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveSnapshotFallback(snapshots: WorkspaceSnapshot[]) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  window.localStorage.setItem(SNAPSHOT_STORAGE_KEY, JSON.stringify(snapshots));
+}
+
+function openSnapshotDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') {
+      reject(new Error('IndexedDB is not available.'));
+      return;
+    }
+
+    const request = indexedDB.open(SNAPSHOT_DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(SNAPSHOT_STORE_NAME)) {
+        db.createObjectStore(SNAPSHOT_STORE_NAME, { keyPath: 'id' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error('Could not open snapshot database.'));
+  });
+}
+
+async function withSnapshotStore<T>(mode: IDBTransactionMode, operation: (store: IDBObjectStore) => IDBRequest<T>): Promise<T> {
+  const db = await openSnapshotDb();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(SNAPSHOT_STORE_NAME, mode);
+    const request = operation(transaction.objectStore(SNAPSHOT_STORE_NAME));
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error('Snapshot operation failed.'));
+    transaction.oncomplete = () => db.close();
+    transaction.onerror = () => {
+      db.close();
+      reject(transaction.error ?? new Error('Snapshot transaction failed.'));
+    };
+  });
+}
+
+export async function loadSnapshots(): Promise<WorkspaceSnapshot[]> {
+  try {
+    const snapshots = await withSnapshotStore<WorkspaceSnapshot[]>('readonly', (store) => store.getAll() as IDBRequest<WorkspaceSnapshot[]>);
+    return snapshots.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  } catch {
+    return loadSnapshotFallback().sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+}
+
+export async function saveSnapshot(snapshot: WorkspaceSnapshot): Promise<WorkspaceSnapshot[]> {
+  const fallbackSnapshots = [snapshot, ...loadSnapshotFallback().filter((entry) => entry.id !== snapshot.id)].slice(0, 50);
+  saveSnapshotFallback(fallbackSnapshots);
+
+  try {
+    await withSnapshotStore('readwrite', (store) => store.put(snapshot));
+    return loadSnapshots();
+  } catch {
+    return fallbackSnapshots;
+  }
+}
+
+export async function deleteSnapshot(snapshotId: string): Promise<WorkspaceSnapshot[]> {
+  const fallbackSnapshots = loadSnapshotFallback().filter((snapshot) => snapshot.id !== snapshotId);
+  saveSnapshotFallback(fallbackSnapshots);
+
+  try {
+    await withSnapshotStore('readwrite', (store) => store.delete(snapshotId));
+    return loadSnapshots();
+  } catch {
+    return fallbackSnapshots;
+  }
 }

@@ -1,15 +1,30 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { App } from './App';
-import { GRAPH_TEMPLATE_STORAGE_KEY, NODE_LIBRARY_STORAGE_KEY, WORKSPACE_STORAGE_KEY } from './storage';
+import { GRAPH_TEMPLATE_STORAGE_KEY, NODE_LIBRARY_STORAGE_KEY, SNAPSHOT_STORAGE_KEY, WORKSPACE_STORAGE_KEY } from './storage';
 
 function addLibraryTile(name: RegExp) {
   fireEvent.click(screen.getByRole('button', { name }));
   fireEvent.click(screen.getByRole('button', { name: /Add selected tile/i }));
 }
 
+function clearSnapshotDatabase() {
+  return new Promise<void>((resolve) => {
+    if (typeof indexedDB === 'undefined') {
+      resolve();
+      return;
+    }
+
+    const request = indexedDB.deleteDatabase('visual-kubernetes');
+    request.onsuccess = () => resolve();
+    request.onerror = () => resolve();
+    request.onblocked = () => resolve();
+  });
+}
+
 describe('App', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     window.localStorage.clear();
+    await clearSnapshotDatabase();
   });
 
   it('adds a new node from the component palette', () => {
@@ -47,14 +62,86 @@ describe('App', () => {
     expect(screen.getByDisplayValue('prod-checkout')).toBeInTheDocument();
   });
 
+  it('collapses only the left components rail without removing the workspace', () => {
+    render(<App />);
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Hide' })[0]!);
+
+    expect(screen.getByRole('button', { name: 'Show' })).toBeInTheDocument();
+    expect(screen.getAllByText('Cluster Graph').length).toBeGreaterThan(0);
+    expect(screen.getByLabelText(/^yaml export$/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Resize left panel/i)).toHaveClass('disabled');
+  });
+
+  it('auto-expands long canvas nodes within the maximum size cap', () => {
+    const { container } = render(<App />);
+
+    const checkoutNode = container.querySelector('g[aria-label="Checkout Service"]');
+    const nodeBody = checkoutNode?.querySelector('rect');
+    const width = Number(nodeBody?.getAttribute('width'));
+    const height = Number(nodeBody?.getAttribute('height'));
+
+    expect(width).toBeGreaterThan(248);
+    expect(width).toBeLessThanOrEqual(372);
+    expect(height).toBeGreaterThanOrEqual(154);
+    expect(height).toBeLessThanOrEqual(231);
+  });
+
   it('renders the scoped menubar and actionbar command labels', () => {
     render(<App />);
 
-    expect(screen.getByRole('button', { name: 'File' })).toHaveAttribute('title', expect.stringContaining('Import YAML'));
-    expect(screen.getByRole('button', { name: 'View' })).toHaveAttribute('title', expect.stringContaining('Toggle Inspector'));
+    expect(screen.getByRole('button', { name: 'File' })).toHaveAttribute('aria-haspopup', 'menu');
+    expect(screen.getByRole('button', { name: 'View' })).toHaveAttribute('aria-haspopup', 'menu');
     expect(screen.getByRole('button', { name: 'Compile' })).toHaveAttribute('title', expect.stringContaining('Validate graph'));
     expect(screen.getByRole('button', { name: 'Blueprint Settings' })).toHaveAttribute('title', expect.stringContaining('stack-wide defaults'));
     expect(screen.getByRole('button', { name: 'Simulate' })).toHaveAttribute('title', expect.stringContaining('traffic'));
+  });
+
+  it('opens top menus and runs overflow commands', () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'View' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /Hide Palette/i }));
+    expect(screen.getByRole('button', { name: 'Show' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Graph' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /Detect Pattern/i }));
+    expect(screen.getByText(/Detected graph pattern:/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Help' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /Shortcuts/i }));
+    expect(screen.getByRole('dialog', { name: /Help/i })).toBeInTheDocument();
+    expect(screen.getByText(/Top menus mirror key toolbar actions/i)).toBeInTheDocument();
+  });
+
+  it('wires actionbar commands for compile find settings simulation and play', () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Compile' }));
+    expect(screen.getByText(/Compile complete: 0 errors/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Full stack YAML/i })).toHaveClass('active');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find' }));
+    fireEvent.change(screen.getByLabelText(/Node search/i), { target: { value: 'orders' } });
+    fireEvent.click(screen.getByRole('button', { name: /Orders DB/i }));
+    expect(screen.getByDisplayValue('Orders DB')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Blueprint Settings' }));
+    fireEvent.change(screen.getAllByLabelText(/Stack name/i).at(-1)!, { target: { value: 'Actionbar Stack' } });
+    expect(screen.getAllByDisplayValue('Actionbar Stack').length).toBeGreaterThan(0);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Close' }).at(-1)!);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cluster Defaults' }));
+    fireEvent.change(screen.getAllByLabelText(/Worker count/i).at(-1)!, { target: { value: '7' } });
+    expect(screen.getAllByDisplayValue('7').length).toBeGreaterThan(0);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Close' }).at(-1)!);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Simulate' }));
+    expect(screen.getByText(/Started request-flow simulation/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Play' }));
+    expect(screen.getByRole('dialog', { name: /Live preview/i })).toBeInTheDocument();
+    expect(screen.getByLabelText(/live preview yaml/i)).toHaveTextContent('kind: Deployment');
   });
 
   it('switches the active environment and updates export output', () => {
@@ -285,6 +372,45 @@ describe('App', () => {
     expect(saved).toContain('cluster-primary-tpl-');
   });
 
+  it('saves restores and deletes workspace snapshots from history', async () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByText(/Saved Manual save/i)).toBeInTheDocument();
+    expect(window.localStorage.getItem(SNAPSHOT_STORAGE_KEY)).toContain('Manual save');
+
+    fireEvent.change(screen.getByLabelText(/Default namespace/i), { target: { value: 'after-save' } });
+    expect(screen.getByDisplayValue('after-save')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /Restore snapshot/i }));
+    expect(await screen.findByDisplayValue('checkout-platform')).toBeInTheDocument();
+    expect(screen.getByText(/Restored Manual save/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /Delete snapshot/i }));
+    expect(await screen.findByText(/No snapshots yet/i)).toBeInTheDocument();
+  });
+
+  it('shows snapshot diff and supports undo redo around template loads', async () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByText(/Saved Manual save/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Diff' }));
+    expect(screen.getAllByText(/Nodes 5 -> 5/i).length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole('button', { name: /Open templates/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Monolith \+ Database/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Replace graph/i }));
+    expect(screen.getAllByText(/Monolith App/i).length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole('button', { name: /History/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^Undo$/i }));
+    expect(screen.getAllByText(/Checkout Service/i).length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole('button', { name: /^Redo$/i }));
+    expect(screen.getAllByText(/Monolith App/i).length).toBeGreaterThan(0);
+  });
+
   it('edits storage depth settings for stateful exports', () => {
     render(<App />);
 
@@ -338,6 +464,22 @@ describe('App', () => {
 
     expect(screen.getByLabelText(/terraform export/i)).toHaveTextContent('resource "kubernetes_manifest"');
     expect(screen.getByLabelText(/terraform export/i)).toHaveTextContent('kind: Secret');
+  });
+
+  it('previews selected-node yaml separately from full-stack yaml', () => {
+    render(<App />);
+
+    fireEvent.click(screen.getAllByText('Checkout Service').at(-1)!);
+    fireEvent.click(screen.getByRole('button', { name: /Selected node YAML/i }));
+
+    expect(screen.getByLabelText(/selected node yaml export/i)).toHaveTextContent('name: service-checkout-sa');
+    expect(screen.getByLabelText(/selected node yaml export/i)).toHaveTextContent('kind: Deployment');
+    expect(screen.getByLabelText(/selected node yaml export/i)).not.toHaveTextContent(/kind: Deployment metadata: name: inventory-service/i);
+    expect(screen.getByRole('button', { name: /Copy selected/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /Download selected/i })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole('button', { name: /Full stack YAML/i }));
+    expect(screen.getByLabelText(/^yaml export$/i)).toHaveTextContent('inventory-service');
   });
 
   it('hydrates older saved workload objects without blanking the app', () => {

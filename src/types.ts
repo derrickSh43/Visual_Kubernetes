@@ -240,6 +240,7 @@ export interface ExportDocument {
   kind: string;
   name: string;
   yaml: string;
+  ownerNodeIds?: string[];
 }
 
 export interface NodeLibraryItem {
@@ -259,4 +260,12 @@ export interface GraphTemplate {
   thumbnail: string;
   workspace: WorkspaceState;
   createdAt?: string;
+}
+
+export interface WorkspaceSnapshot {
+  id: string;
+  name: string;
+  createdAt: string;
+  summary: string;
+  workspace: WorkspaceState;
 }
