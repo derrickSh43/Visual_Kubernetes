@@ -4,7 +4,7 @@ import { GRAPH_TEMPLATE_STORAGE_KEY, NODE_LIBRARY_STORAGE_KEY, SNAPSHOT_STORAGE_
 
 function addLibraryTile(name: RegExp) {
   fireEvent.click(screen.getByRole('button', { name }));
-  fireEvent.click(screen.getByRole('button', { name: /Add selected tile/i }));
+  fireEvent.click(screen.getByRole('button', { name: /Add node/i }));
 }
 
 function clearSnapshotDatabase() {
@@ -43,6 +43,22 @@ describe('App', () => {
     expect(screen.getAllByText(/generic workload/i).length).toBeGreaterThan(0);
     expect(screen.getByLabelText(/yaml export/i)).toHaveTextContent('image: ghcr.io/visual-kubernetes/custom-workload:latest');
     expect(screen.getByLabelText(/yaml export/i)).toHaveTextContent('kind: Deployment');
+  });
+
+  it('filters the node library and exposes core custom tabs', () => {
+    render(<App />);
+
+    expect(screen.getByRole('tab', { name: 'Core' })).toHaveAttribute('aria-selected', 'true');
+
+    fireEvent.change(screen.getByLabelText(/Search node library/i), { target: { value: 'redis' } });
+
+    expect(screen.getByRole('button', { name: /Add redis cache/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Add rest service/i })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Custom' }));
+
+    expect(screen.getByRole('tab', { name: 'Custom' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByText(/No custom tiles yet/i)).toBeInTheDocument();
   });
 
   it('persists workspace changes to local storage', () => {
@@ -304,7 +320,7 @@ describe('App', () => {
     render(<App />);
 
     fireEvent.click(screen.getAllByText('Checkout Service').at(-1)!);
-    fireEvent.click(screen.getByRole('button', { name: /Save selected as custom/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Save as custom/i }));
     fireEvent.change(screen.getByLabelText(/Custom tile notes/i), { target: { value: 'Reusable checkout service tile' } });
 
     const customLibrary = window.localStorage.getItem(NODE_LIBRARY_STORAGE_KEY) ?? '';
@@ -347,7 +363,7 @@ describe('App', () => {
   it('loads an out-of-box graph template by replacing the current graph', () => {
     render(<App />);
 
-    fireEvent.click(screen.getByRole('button', { name: /Open templates/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Templates/i }));
     fireEvent.click(screen.getByRole('button', { name: /Monolith \+ Database/i }));
     fireEvent.click(screen.getByRole('button', { name: /Replace graph/i }));
 
@@ -398,7 +414,7 @@ describe('App', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Diff' }));
     expect(screen.getAllByText(/Nodes 5 -> 5/i).length).toBeGreaterThan(0);
 
-    fireEvent.click(screen.getByRole('button', { name: /Open templates/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Templates/i }));
     fireEvent.click(screen.getByRole('button', { name: /Monolith \+ Database/i }));
     fireEvent.click(screen.getByRole('button', { name: /Replace graph/i }));
     expect(screen.getAllByText(/Monolith App/i).length).toBeGreaterThan(0);

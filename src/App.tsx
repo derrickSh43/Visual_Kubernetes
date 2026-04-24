@@ -28,6 +28,19 @@ import {
 } from './storage';
 import type { ArchitectureEdge, ArchitectureNode, CloudProvider, Cluster, EdgeType, EnvironmentName, GraphTemplate, NetworkPolicyIntent, NodeLibraryItem, NodeType, WorkspaceSnapshot, WorkspaceState } from './types';
 
+function LeftSection({ title, children, noPadding = false, defaultOpen = true }: { title: string; children: React.ReactNode; noPadding?: boolean; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="left-section">
+      <button type="button" className="left-section-header" onClick={() => setOpen((v) => !v)}>
+        <span className={`section-chevron${open ? '' : ' collapsed'}`}>&#9660;</span>
+        <span className="left-section-title">{title}</span>
+      </button>
+      {open && <div className={noPadding ? 'left-section-body no-padding' : 'left-section-body'}>{children}</div>}
+    </div>
+  );
+}
+
 const nodeColors: Record<NodeType, string> = {
   ingress: '#4dabf7',
   frontend: '#ff6b6b',
@@ -266,6 +279,8 @@ export function App() {
   const [dockHeight, setDockHeight] = useState(320);
   const [selectedClusterId, setSelectedClusterId] = useState(workspace.model.clusters[0]?.id ?? '');
   const [libraryTab, setLibraryTab] = useState<'core' | 'custom'>('core');
+  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
+  const [libraryQuery, setLibraryQuery] = useState('');
   const [selectedLibraryItemId, setSelectedLibraryItemId] = useState(coreNodeLibrary[0]?.id ?? '');
   const [customNodeLibrary, setCustomNodeLibrary] = useState<NodeLibraryItem[]>(() => loadCustomNodeLibrary());
   const [templatesOpen, setTemplatesOpen] = useState(false);
@@ -373,6 +388,30 @@ export function App() {
       .slice(0, 12);
   }, [findQuery, model.nodes]);
   const activeLibraryItems = libraryTab === 'core' ? coreNodeLibrary : customNodeLibrary;
+  const filteredLibraryItems = useMemo(() => {
+    const query = libraryQuery.trim().toLowerCase();
+    if (!query) {
+      return activeLibraryItems;
+    }
+
+    return activeLibraryItems.filter((item) =>
+      [item.name, item.type, item.description, item.notes].some((value) => value.toLowerCase().includes(query)),
+    );
+  }, [activeLibraryItems, libraryQuery]);
+  const librarySections = useMemo(() => {
+    const categoryOrder = ['Entry', 'Workload', 'Data', 'Security', 'Custom'];
+    const categoryForItem = (item: NodeLibraryItem) => {
+      if (libraryTab === 'custom') return 'Custom';
+      if (['ingress', 'gateway', 'frontend'].includes(item.type)) return 'Entry';
+      if (['database', 'cache', 'queue'].includes(item.type)) return 'Data';
+      if (['networkPolicy', 'role'].includes(item.type)) return 'Security';
+      return 'Workload';
+    };
+
+    return categoryOrder
+      .map((category) => ({ category, items: filteredLibraryItems.filter((item) => categoryForItem(item) === category) }))
+      .filter((section) => section.items.length > 0);
+  }, [filteredLibraryItems, libraryTab]);
   const selectedLibraryItem = activeLibraryItems.find((item) => item.id === selectedLibraryItemId) ?? activeLibraryItems[0] ?? coreNodeLibrary[0];
   const activeGraphTemplates = templateTab === 'builtin' ? builtinGraphTemplates : customGraphTemplates;
   const selectedGraphTemplate = activeGraphTemplates.find((template) => template.id === selectedTemplateId) ?? activeGraphTemplates[0] ?? builtinGraphTemplates[0];
@@ -426,7 +465,7 @@ export function App() {
 
       if (leftRailResizeRef.current) {
         const delta = event.clientX - leftRailResizeRef.current.startX;
-        setLeftRailWidth(Math.min(560, Math.max(300, leftRailResizeRef.current.startWidth + delta)));
+        setLeftRailWidth(Math.min(560, Math.max(360, leftRailResizeRef.current.startWidth + delta)));
       }
 
       if (rightRailResizeRef.current) {
@@ -1674,8 +1713,7 @@ export function App() {
         </div>
         {leftRailOpen && (
           <div className="rail-content">
-            <div className="section-card">
-              <div className="section-title">Project</div>
+            <LeftSection title="Project">
               <div className="field-grid">
                 <label>
                   Stack name
@@ -1714,58 +1752,118 @@ export function App() {
                   {providerProfile.storageClassName} storage | {providerProfile.ingressClassName} ingress | {providerProfile.loadBalancerMode}
                 </div>
               </div>
-            </div>
+            </LeftSection>
 
-            <div className="section-card node-library-card">
-              <div className="section-title">Node library</div>
-              <div className="library-tabs" aria-label="Node library tabs">
-                <button type="button" className={libraryTab === 'core' ? 'mini-tab active' : 'mini-tab'} onClick={() => setLibraryTab('core')}>
-                  Core
-                </button>
-                <button type="button" className={libraryTab === 'custom' ? 'mini-tab active' : 'mini-tab'} onClick={() => setLibraryTab('custom')}>
-                  Custom
-                </button>
+            <LeftSection title="Node Library" noPadding>
+              <div className="node-library-search-row">
+                <label className="node-library-search">
+                  <span className="sr-only">Search node library</span>
+                  <span className="node-library-search-icon">&#9906;</span>
+                  <input
+                    aria-label="Search node library"
+                    placeholder="Search..."
+                    value={libraryQuery}
+                    onChange={(event) => setLibraryQuery(event.target.value)}
+                  />
+                </label>
+                <div className="node-library-tab-pills" role="tablist" aria-label="Node library tabs">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={libraryTab === 'core'}
+                    className={libraryTab === 'core' ? 'lib-pill active' : 'lib-pill'}
+                    onClick={() => { setLibraryTab('core'); setCollapsedSections(new Set()); }}
+                  >
+                    Core
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={libraryTab === 'custom'}
+                    className={libraryTab === 'custom' ? 'lib-pill active' : 'lib-pill'}
+                    onClick={() => { setLibraryTab('custom'); setCollapsedSections(new Set()); }}
+                  >
+                    Custom
+                  </button>
+                </div>
               </div>
+
               <div className="node-library-grid" aria-label="Node library">
-                {activeLibraryItems.length > 0 ? (
-                  activeLibraryItems.map((item) => (
-                    <button
-                      key={item.id}
-                      type="button"
-                      className={item.id === selectedLibraryItem?.id ? 'node-library-tile active' : 'node-library-tile'}
-                      draggable
-                      onClick={() => setSelectedLibraryItemId(item.id)}
-                      onDoubleClick={() => addNodeFromLibrary(item)}
-                      onDragStart={(event) => {
-                        event.dataTransfer.setData('application/visual-kubernetes-node', JSON.stringify({ source: libraryTab, id: item.id }));
-                        event.dataTransfer.effectAllowed = 'copy';
-                      }}
-                      onContextMenu={(event) => {
-                        if (libraryTab === 'custom') {
-                          event.preventDefault();
-                          deleteCustomLibraryItem(item.id);
-                        }
-                      }}
-                      title={item.notes}
-                      aria-label={`Add ${item.name}`}
-                    >
-                      <span className="tile-icon">{item.icon}</span>
-                      <span className="tile-main">
-                        <strong>{item.name}</strong>
-                        <small>{item.description}</small>
-                      </span>
-                    </button>
-                  ))
+                {librarySections.length > 0 ? (
+                  librarySections.map((section) => {
+                    const isCollapsed = collapsedSections.has(section.category);
+                    return (
+                      <div key={section.category} className="node-library-section">
+                        <button
+                          type="button"
+                          className="node-library-section-title"
+                          aria-expanded={!isCollapsed}
+                          onClick={() =>
+                            setCollapsedSections((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(section.category)) next.delete(section.category);
+                              else next.add(section.category);
+                              return next;
+                            })
+                          }
+                        >
+                          <span className={`section-chevron${isCollapsed ? ' collapsed' : ''}`}>&#9660;</span>
+                          <span>{section.category}</span>
+                          <span className="section-count">{section.items.length}</span>
+                        </button>
+                        {!isCollapsed && (
+                          <div className="node-library-section-grid">
+                            {section.items.map((item) => (
+                              <button
+                                key={item.id}
+                                type="button"
+                                className={item.id === selectedLibraryItem?.id ? 'node-library-tile active' : 'node-library-tile'}
+                                data-node-type={item.type}
+                                data-category={section.category.toLowerCase()}
+                                draggable
+                                onClick={() => setSelectedLibraryItemId(item.id)}
+                                onDoubleClick={() => addNodeFromLibrary(item)}
+                                onDragStart={(event) => {
+                                  event.dataTransfer.setData(
+                                    'application/visual-kubernetes-node',
+                                    JSON.stringify({ source: libraryTab, id: item.id }),
+                                  );
+                                  event.dataTransfer.effectAllowed = 'copy';
+                                }}
+                                onContextMenu={(event) => {
+                                  if (libraryTab === 'custom') {
+                                    event.preventDefault();
+                                    deleteCustomLibraryItem(item.id);
+                                  }
+                                }}
+                                title={item.notes}
+                                aria-label={`Add ${item.name}`}
+                              >
+                                <span className="tile-icon">{item.icon}</span>
+                                <span className="tile-name">{item.name}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })
                 ) : (
                   <div className="node-type-description">
-                    No custom tiles yet. Select a node on the canvas and save it as a custom tile.
+                    {libraryTab === 'custom'
+                      ? 'No custom tiles yet. Select a node on the canvas and use Save as custom.'
+                      : 'No tiles match your search.'}
                   </div>
                 )}
               </div>
+
               {selectedLibraryItem && (
-                <div className="behavior-card">
-                  <strong>{selectedLibraryItem.name}</strong>
-                  <span>{selectedLibraryItem.notes}</span>
+                <div className="lib-info-card">
+                  <span className="tile-icon">{selectedLibraryItem.icon}</span>
+                  <div className="lib-info-text">
+                    <strong>{selectedLibraryItem.name}</strong>
+                    <span>{selectedLibraryItem.notes}</span>
+                  </div>
                 </div>
               )}
               {libraryTab === 'custom' && selectedLibraryItem && (
@@ -1776,20 +1874,21 @@ export function App() {
                   onChange={(event) => updateCustomLibraryItem(selectedLibraryItem.id, { notes: event.target.value })}
                 />
               )}
-              <button type="button" className="primary-button wide" onClick={() => selectedLibraryItem && addNodeFromLibrary(selectedLibraryItem)}>
-                Add selected tile
-              </button>
-              <button type="button" className="ghost-button wide" onClick={saveSelectedNodeAsCustomTile}>
-                Save selected as custom
-              </button>
-              <button type="button" className="ghost-button wide" onClick={() => setTemplatesOpen(true)}>
-                Open templates
-              </button>
-              <div className="node-type-description">Drag a tile onto the graph, double-click it, or use Add selected tile.</div>
-            </div>
+              <div className="lib-action-row">
+                <button type="button" className="primary-button" onClick={() => selectedLibraryItem && addNodeFromLibrary(selectedLibraryItem)}>
+                  Add node
+                </button>
+                <button type="button" className="ghost-button" onClick={saveSelectedNodeAsCustomTile}>
+                  Save as custom
+                </button>
+                <button type="button" className="ghost-button" onClick={() => setTemplatesOpen(true)}>
+                  Templates
+                </button>
+              </div>
+              <div className="node-type-description">Drag a tile onto the canvas, double-click, or use Add node.</div>
+            </LeftSection>
 
-            <div className="section-card">
-              <div className="section-title">Clusters</div>
+            <LeftSection title="Clusters">
               <div className="cluster-list" aria-label="Clusters">
                 {clusterSummaries.map(({ cluster, nodes }) => (
                   <button
@@ -1814,10 +1913,9 @@ export function App() {
                   Assign selected node
                 </button>
               )}
-            </div>
+            </LeftSection>
 
-            <div className="section-card">
-              <div className="section-title">Connections</div>
+            <LeftSection title="Connections">
               <div className="field-grid">
                 <label>
                   From
@@ -1929,14 +2027,13 @@ export function App() {
               <button type="button" className="primary-button wide" onClick={() => addEdge()}>
                 Add connection
               </button>
-            </div>
+            </LeftSection>
 
-            <div className="section-card compact">
-              <div className="section-title">Workspace</div>
+            <LeftSection title="Workspace" defaultOpen={false}>
               <button type="button" className="ghost-button wide" onClick={resetWorkspace}>
                 Reset model
               </button>
-            </div>
+            </LeftSection>
           </div>
         )}
       </aside>
