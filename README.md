@@ -4,6 +4,10 @@ Visual Kubernetes is an MVP for the idea described in the original concept note:
 
 ![Visual Kubernetes social preview](assets/github-social-preview.png)
 
+## Current app preview
+
+![Visual Kubernetes app screenshot](assets/app-screenshot.png)
+
 ## Status and security notice
 
 This project is an unfinished MVP/prototype. Run it locally only.
