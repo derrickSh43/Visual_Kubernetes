@@ -419,7 +419,7 @@ describe('App', () => {
     fireEvent.click(screen.getByRole('button', { name: /Replace graph/i }));
     expect(screen.getAllByText(/Monolith App/i).length).toBeGreaterThan(0);
 
-    fireEvent.click(screen.getByRole('button', { name: /History/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /History/i }));
     fireEvent.click(screen.getByRole('button', { name: /^Undo$/i }));
     expect(screen.getAllByText(/Checkout Service/i).length).toBeGreaterThan(0);
 

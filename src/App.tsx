@@ -2444,11 +2444,23 @@ export function App() {
         </div>
         {rightRailOpen && (
           <div className="rail-content inspector-content">
-            <div className="library-tabs" aria-label="Right panel tabs">
-              <button type="button" className={rightPanelTab === 'inspector' ? 'mini-tab active' : 'mini-tab'} onClick={() => setRightPanelTab('inspector')}>
+            <div className="right-panel-tabs" role="tablist" aria-label="Right panel tabs">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={rightPanelTab === 'inspector'}
+                className={rightPanelTab === 'inspector' ? 'lib-pill active' : 'lib-pill'}
+                onClick={() => setRightPanelTab('inspector')}
+              >
                 Inspector
               </button>
-              <button type="button" className={rightPanelTab === 'history' ? 'mini-tab active' : 'mini-tab'} onClick={() => setRightPanelTab('history')}>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={rightPanelTab === 'history'}
+                className={rightPanelTab === 'history' ? 'lib-pill active' : 'lib-pill'}
+                onClick={() => setRightPanelTab('history')}
+              >
                 History
               </button>
             </div>

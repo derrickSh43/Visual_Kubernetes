@@ -339,13 +339,96 @@ button {
   scrollbar-gutter: stable;
 }
 
-/* right rail inspector keeps the padded grid layout */
 .inspector-content.rail-content {
-  padding: 8px;
-  display: grid;
-  align-content: start;
-  gap: 8px;
-  padding-bottom: 12px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  align-content: stretch;
+}
+
+.right-panel-tabs {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 5px 6px;
+  border-bottom: 1px solid #1e2025;
+  background: #16171b;
+  flex-shrink: 0;
+}
+
+.right-panel-tabs .lib-pill {
+  flex: 1;
+}
+
+.right-rail .section-card {
+  gap: 0;
+  padding: 0;
+  border: 0;
+  border-bottom: 1px solid #1c1e23;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.right-rail .section-card > .section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 10px;
+  border-bottom: 1px solid #1a1c20;
+  background: #1a1c21;
+  color: #8a909a;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.right-rail .section-card > .section-title::before {
+  content: "";
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 6px solid #4a5060;
+}
+
+.right-rail .section-card > :not(.section-title) {
+  margin: 8px;
+}
+
+.right-rail .section-card.compact {
+  gap: 0;
+}
+
+.right-rail .field-grid {
+  grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+}
+
+.right-rail .quick-actions {
+  grid-template-columns: repeat(auto-fit, minmax(116px, 1fr));
+}
+
+.right-rail .behavior-card,
+.right-rail .status-chip,
+.right-rail .derived-env-item,
+.right-rail .validation-item,
+.right-rail .snapshot-item {
+  border-radius: 3px;
+  background: #111317;
+}
+
+.right-rail .selected-name {
+  color: #dce3ec;
+  font-size: 0.94rem;
+}
+
+.right-rail .selected-subtle,
+.right-rail .mini-metrics {
+  gap: 6px;
+  color: #8f96a3;
 }
 
 .rail-content::-webkit-scrollbar,
