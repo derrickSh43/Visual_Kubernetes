@@ -2,6 +2,21 @@
 
 Visual Kubernetes is an MVP for the idea described in the original concept note: a visual-first architecture workspace that lets engineers model a system, validate the design, and generate the infrastructure story without writing Kubernetes YAML by hand.
 
+## Status and security notice
+
+This project is an unfinished MVP/prototype. Run it locally only.
+
+Do not deploy this app to a public server, put it behind the internet, or treat it as production software yet. The current focus is validating the product workflow and generated infrastructure model, not hardening the application for hostile users or public access.
+
+Known prototype constraints:
+
+- No authentication or authorization model has been designed.
+- Local browser storage is used for workspace state.
+- Exported YAML/Terraform should be reviewed before being applied to real infrastructure.
+- Security hardening, threat modeling, input trust boundaries, and deployment controls are not complete.
+
+If you are reviewing this repo, please evaluate the workflow and direction as an early local tool. Security feedback is welcome, but this is not being presented as a finished or production-ready system.
+
 ## What is implemented
 
 - Interactive React + TypeScript frontend built with Vite
@@ -19,12 +34,7 @@ Visual Kubernetes is an MVP for the idea described in the original concept note:
 
 ## Current MVP scope
 
-The current app models four infrastructure primitives:
-
-- `ingress`
-- `service`
-- `database`
-- `queue`
+The current app models a growing set of Kubernetes-oriented components, including ingress, gateways, frontend/service workloads, workers, databases, caches, queues, jobs, cronjobs, network policies, and RBAC roles.
 
 It also supports three relationship types:
 
