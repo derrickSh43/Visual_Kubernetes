@@ -2,6 +2,8 @@
 
 Visual Kubernetes is an MVP for the idea described in the original concept note: a visual-first architecture workspace that lets engineers model a system, validate the design, and generate the infrastructure story without writing Kubernetes YAML by hand.
 
+![Visual Kubernetes social preview](assets/github-social-preview.png)
+
 ## Status and security notice
 
 This project is an unfinished MVP/prototype. Run it locally only.
