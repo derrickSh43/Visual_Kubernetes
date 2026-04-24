@@ -4,6 +4,8 @@ import type {
   ArchitectureNode,
   CanvasLayout,
   EnvironmentName,
+  GraphTemplate,
+  NodeLibraryItem,
   NodeEnvironmentOverride,
   NodeType,
   WorkspaceState,
@@ -20,6 +22,164 @@ export const availableNodeTypes: Array<{ type: NodeType; label: string; descript
   { type: 'cache', label: 'Cache', description: 'Low-latency in-memory store' },
   { type: 'database', label: 'Database', description: 'Persistent stateful storage' },
   { type: 'ingress', label: 'Ingress', description: 'External traffic entrypoint' },
+  { type: 'networkPolicy', label: 'NetworkPolicy', description: 'Explicit namespace traffic policy' },
+  { type: 'role', label: 'Role', description: 'Explicit RBAC role and service account binding' },
+];
+
+export const coreNodeLibrary: NodeLibraryItem[] = [
+  {
+    id: 'nginx-ingress',
+    type: 'ingress',
+    name: 'nginx ingress',
+    description: 'External HTTP entrypoint',
+    notes: 'Creates an ingress-style node with nginx defaults and public exposure.',
+    icon: 'IG',
+    overrides: { name: 'nginx ingress', image: 'nginx', tag: '1.27' },
+  },
+  {
+    id: 'api-gateway',
+    type: 'gateway',
+    name: 'api gateway',
+    description: 'North-south API router',
+    notes: 'Gateway workload for routing service traffic behind an ingress.',
+    icon: 'GW',
+    overrides: { name: 'api gateway', image: 'ghcr.io/visual-kubernetes/gateway', tag: 'latest' },
+  },
+  {
+    id: 'web-frontend',
+    type: 'frontend',
+    name: 'web frontend',
+    description: 'Browser-facing app',
+    notes: 'Frontend deployment with HPA enabled and standard HTTP probes.',
+    icon: 'FE',
+    overrides: { name: 'web frontend', image: 'ghcr.io/visual-kubernetes/frontend', tag: 'latest' },
+  },
+  {
+    id: 'rest-service',
+    type: 'service',
+    name: 'rest service',
+    description: 'Core HTTP service',
+    notes: 'General service node for business logic and Kubernetes Service export.',
+    icon: 'SV',
+    overrides: { name: 'rest service', image: 'ghcr.io/visual-kubernetes/service', tag: 'latest' },
+  },
+  {
+    id: 'generic-workload',
+    type: 'service',
+    name: 'generic workload',
+    description: 'Fallback custom workload',
+    notes: 'Escape hatch for anything not covered by the library. Starts as a runnable Deployment plus Service; refine image, ports, probes, resources, and kind in the inspector.',
+    icon: 'GN',
+    overrides: { name: 'generic workload', image: 'ghcr.io/visual-kubernetes/custom-workload', tag: 'latest' },
+  },
+  {
+    id: 'worker',
+    type: 'worker',
+    name: 'queue worker',
+    description: 'Background consumer',
+    notes: 'Outbound-only worker that can consume queues, APIs, and data stores.',
+    icon: 'WK',
+    overrides: { name: 'queue worker', image: 'ghcr.io/visual-kubernetes/worker', tag: 'latest' },
+  },
+  {
+    id: 'postgres-ha',
+    type: 'database',
+    name: 'postgres HA',
+    description: 'Stateful relational DB',
+    notes: 'Postgres StatefulSet with durable storage and backup intent enabled.',
+    icon: 'PG',
+    overrides: { name: 'postgres HA', image: 'postgres', tag: '16', replicas: 2 },
+  },
+  {
+    id: 'redis-cache',
+    type: 'cache',
+    name: 'redis cache',
+    description: 'Low-latency cache',
+    notes: 'Redis StatefulSet with ClusterIP service and optional storage.',
+    icon: 'RD',
+    overrides: { name: 'redis cache', image: 'redis', tag: '7' },
+  },
+  {
+    id: 'rabbitmq',
+    type: 'queue',
+    name: 'rabbitmq',
+    description: 'AMQP event broker',
+    notes: 'RabbitMQ queue node with durable storage and TCP service defaults.',
+    icon: 'MQ',
+    overrides: { name: 'rabbitmq', image: 'rabbitmq', tag: '3-management' },
+  },
+  {
+    id: 'celery-worker',
+    type: 'worker',
+    name: 'celery worker',
+    description: 'Python async worker',
+    notes: 'Worker pattern for Celery-style background jobs.',
+    icon: 'CY',
+    overrides: { name: 'celery worker', image: 'ghcr.io/visual-kubernetes/celery-worker', tag: 'latest' },
+  },
+  {
+    id: 'cron-maintenance',
+    type: 'cronjob',
+    name: 'maintenance cron',
+    description: 'Scheduled maintenance',
+    notes: 'CronJob pattern for recurring cleanup, reports, or sync tasks.',
+    icon: 'CR',
+    overrides: { name: 'maintenance cron', image: 'ghcr.io/visual-kubernetes/cronjob', tag: 'latest' },
+  },
+  {
+    id: 'batch-job',
+    type: 'job',
+    name: 'batch job',
+    description: 'One-time workload',
+    notes: 'Kubernetes Job for migrations, imports, or one-shot processing.',
+    icon: 'JB',
+    overrides: { name: 'batch job', image: 'ghcr.io/visual-kubernetes/job', tag: 'latest' },
+  },
+  {
+    id: 'envoy-proxy',
+    type: 'gateway',
+    name: 'envoy proxy',
+    description: 'L7 proxy sidecar/front proxy',
+    notes: 'Gateway-flavored proxy node for service mesh or edge proxy designs.',
+    icon: 'EV',
+    overrides: { name: 'envoy proxy', image: 'envoyproxy/envoy', tag: 'v1.31-latest' },
+  },
+  {
+    id: 'network-policy',
+    type: 'networkPolicy',
+    name: 'network policy',
+    description: 'Explicit traffic policy',
+    notes: 'Selector-driven NetworkPolicy node for ingress and egress rules.',
+    icon: 'NP',
+    overrides: { name: 'network policy' },
+  },
+  {
+    id: 'rbac-role',
+    type: 'role',
+    name: 'rbac role',
+    description: 'Role and RoleBinding',
+    notes: 'Explicit RBAC node for binding service accounts to rules.',
+    icon: 'RB',
+    overrides: { name: 'rbac role' },
+  },
+  {
+    id: 'external-api',
+    type: 'service',
+    name: 'external api adapter',
+    description: 'Outbound integration adapter',
+    notes: 'Service pattern for wrapping external APIs and centralizing credentials.',
+    icon: 'EA',
+    overrides: { name: 'external api adapter', image: 'ghcr.io/visual-kubernetes/api-adapter', tag: 'latest' },
+  },
+  {
+    id: 'ml-inference',
+    type: 'service',
+    name: 'ml inference',
+    description: 'Model-serving endpoint',
+    notes: 'HTTP service pattern for inference APIs with resource limits.',
+    icon: 'ML',
+    overrides: { name: 'ml inference', image: 'ghcr.io/visual-kubernetes/ml-inference', tag: 'latest' },
+  },
 ];
 
 export const supportedEnvironments: EnvironmentName[] = ['dev', 'stage', 'prod'];
@@ -51,7 +211,7 @@ function defaultProbeType(type: NodeType) {
 }
 
 function defaultStartupProbe(type: NodeType, port: number) {
-  if (type === 'job' || type === 'cronjob') {
+  if (type === 'job' || type === 'cronjob' || type === 'networkPolicy' || type === 'role') {
     return disabledProbe('/ready', port);
   }
 
@@ -83,6 +243,29 @@ function defaultWorkloadKind(type: NodeType) {
     return 'CronJob' as const;
   }
   return 'Deployment' as const;
+}
+
+function defaultNetworkPolicy(type: NodeType) {
+  return {
+    targetLabels: [{ key: 'app', value: type === 'networkPolicy' ? 'replace-me' : '' }],
+    ingressFromLabels: [] as Array<{ key: string; value: string }>,
+    egressToCidrs: [] as string[],
+    allowIngress: true,
+    allowEgress: false,
+  };
+}
+
+function defaultRole(type: NodeType, id: string) {
+  return {
+    serviceAccounts: type === 'role' ? [`${id}-sa`] : [] as string[],
+    rules: [
+      {
+        apiGroups: [''],
+        resources: type === 'role' ? ['configmaps', 'secrets'] : ['configmaps'],
+        verbs: ['get', 'list', 'watch'],
+      },
+    ],
+  };
 }
 
 function storageDefaults(type: NodeType) {
@@ -135,8 +318,12 @@ function createNode(id: string, name: string, type: NodeType, overrides: Partial
                   ? 'ghcr.io/visual-kubernetes/worker'
                   : type === 'job'
                     ? 'ghcr.io/visual-kubernetes/job'
-                    : type === 'cronjob'
-                      ? 'ghcr.io/visual-kubernetes/cronjob'
+                  : type === 'cronjob'
+                    ? 'ghcr.io/visual-kubernetes/cronjob'
+                    : type === 'networkPolicy'
+                      ? 'policy.visual-kubernetes.local/network-policy'
+                      : type === 'role'
+                        ? 'policy.visual-kubernetes.local/role'
                   : type === 'ingress'
                     ? 'nginx'
                     : 'ghcr.io/visual-kubernetes/service',
@@ -149,6 +336,8 @@ function createNode(id: string, name: string, type: NodeType, overrides: Partial
             ? '7'
             : type === 'ingress'
               ? '1.27'
+              : type === 'networkPolicy' || type === 'role'
+                ? 'v1'
               : 'latest',
     containerPort: defaultPort,
     env: [],
@@ -194,6 +383,8 @@ function createNode(id: string, name: string, type: NodeType, overrides: Partial
       allowPrivilegeEscalation: false,
       seccompProfile: 'RuntimeDefault',
     },
+    networkPolicy: defaultNetworkPolicy(type),
+    role: defaultRole(type, id),
     ingress: {
       enabled: type === 'ingress',
       host: `${id}.example.internal`,
@@ -431,6 +622,16 @@ export const starterArchitecture: ArchitectureModel = {
   defaultNamespace: 'checkout-platform',
   provider: 'aws',
   activeEnvironment: 'prod',
+  clusters: [
+    {
+      id: 'cluster-primary',
+      name: 'Primary EKS',
+      provider: 'aws',
+      region: 'us-east-1',
+      workerCount: 3,
+      nodeIds: starterNodes.map((node) => node.id),
+    },
+  ],
   nodes: starterNodes,
   edges: starterEdges,
 };
@@ -448,6 +649,186 @@ export const starterWorkspace: WorkspaceState = {
   layout: starterLayout,
 };
 
+const monolithNodes: ArchitectureNode[] = [
+  createNode('ingress-monolith', 'Public Web', 'ingress', {
+    namespace: 'monolith',
+    service: { type: 'LoadBalancer', port: 80, exposure: 'external', loadBalancerScope: 'public', externalTrafficPolicy: 'Cluster' },
+    ingress: {
+      enabled: true,
+      host: 'app.example.internal',
+      path: '/',
+      tlsEnabled: true,
+      tlsSecretName: 'app-tls',
+      tlsIssuer: 'letsencrypt-prod',
+      ingressClassName: 'nginx',
+      exposure: 'external',
+      loadBalancerScope: 'public',
+    },
+  }),
+  createNode('service-monolith', 'Monolith App', 'service', {
+    namespace: 'monolith',
+    image: 'ghcr.io/visual-kubernetes/monolith',
+    tag: '1.0.0',
+    replicas: 3,
+    env: [{ key: 'DATABASE_HOST', value: 'postgres.monolith.svc.cluster.local' }],
+  }),
+  createNode('db-monolith', 'Postgres', 'database', {
+    namespace: 'monolith',
+    storage: {
+      enabled: true,
+      size: '30Gi',
+      storageClassName: 'gp3',
+      accessMode: 'ReadWriteOnce',
+      volumeMode: 'Filesystem',
+      mountPath: '/var/lib/postgresql/data',
+      retainOnDelete: 'Retain',
+      retainOnScaleDown: 'Retain',
+      backupEnabled: true,
+      backupSchedule: '0 2 * * *',
+    },
+  }),
+];
+
+const threeTierNodes: ArchitectureNode[] = [
+  createNode('ingress-three-tier', 'Public Edge', 'ingress', { namespace: 'web' }),
+  createNode('frontend-three-tier', 'Web Frontend', 'frontend', { namespace: 'web', image: 'ghcr.io/visual-kubernetes/web-frontend' }),
+  createNode('api-three-tier', 'API Service', 'service', { namespace: 'app', image: 'ghcr.io/visual-kubernetes/api' }),
+  createNode('db-three-tier', 'Application DB', 'database', { namespace: 'data', storage: { ...storageDefaults('database'), size: '40Gi', backupEnabled: true } }),
+];
+
+const mlPipelineNodes: ArchitectureNode[] = [
+  createNode('ingress-ml', 'Inference API', 'ingress', { namespace: 'ml' }),
+  createNode('service-inference', 'Model Inference', 'service', {
+    namespace: 'ml',
+    image: 'ghcr.io/visual-kubernetes/ml-inference',
+    replicas: 3,
+    resources: { requestsCpu: '1000m', requestsMemory: '2Gi', limitsCpu: '4000m', limitsMemory: '8Gi' },
+  }),
+  createNode('queue-features', 'Feature Jobs', 'queue', { namespace: 'ml', image: 'rabbitmq', tag: '3-management' }),
+  createNode('worker-training', 'Training Worker', 'worker', {
+    namespace: 'ml',
+    image: 'ghcr.io/visual-kubernetes/training-worker',
+    resources: { requestsCpu: '2000m', requestsMemory: '4Gi', limitsCpu: '8000m', limitsMemory: '16Gi' },
+  }),
+  createNode('cache-features', 'Feature Cache', 'cache', { namespace: 'ml', image: 'redis', tag: '7' }),
+];
+
+function workspaceTemplate(
+  id: string,
+  name: string,
+  notes: string,
+  thumbnail: string,
+  workspace: WorkspaceState,
+): GraphTemplate {
+  return { id, name, notes, thumbnail, workspace };
+}
+
+function templateWorkspace(
+  name: string,
+  provider: ArchitectureModel['provider'],
+  nodes: ArchitectureNode[],
+  edges: ArchitectureEdge[],
+  layout: CanvasLayout,
+): WorkspaceState {
+  return {
+    model: {
+      name,
+      defaultNamespace: nodes[0]?.namespace ?? 'default',
+      provider,
+      activeEnvironment: 'prod',
+      clusters: [
+        {
+          id: 'cluster-primary',
+          name: provider === 'aws' ? 'Primary EKS' : provider === 'gcp' ? 'Primary GKE' : provider === 'azure' ? 'Primary AKS' : 'Primary Cluster',
+          provider,
+          region: provider === 'gcp' ? 'us-central1' : provider === 'azure' ? 'eastus' : 'us-east-1',
+          workerCount: Math.max(3, Math.ceil(nodes.length / 2)),
+          nodeIds: nodes.map((node) => node.id),
+        },
+      ],
+      nodes,
+      edges,
+    },
+    layout,
+  };
+}
+
+export const builtinGraphTemplates: GraphTemplate[] = [
+  workspaceTemplate(
+    'template-microservices-starter',
+    'Microservices Starter',
+    'Checkout-style event-driven starter with ingress, services, queue, database, namespaces, storage, and environment overrides.',
+    'IG -> API -> SVC + MQ + DB',
+    starterWorkspace,
+  ),
+  workspaceTemplate(
+    'template-monolith',
+    'Monolith + Database',
+    'Simple production web app with one service and one stateful database behind a public ingress.',
+    'WEB -> APP -> DB',
+    templateWorkspace(
+      'Monolith Platform',
+      'aws',
+      monolithNodes,
+      [
+        { id: 'mono-e1', from: 'ingress-monolith', to: 'service-monolith', type: 'http', latencyBudgetMs: 120, networkPolicy: 'allow' },
+        { id: 'mono-e2', from: 'service-monolith', to: 'db-monolith', type: 'data', latencyBudgetMs: 40, networkPolicy: 'allow' },
+      ],
+      {
+        'ingress-monolith': { x: 100, y: 150 },
+        'service-monolith': { x: 390, y: 150 },
+        'db-monolith': { x: 680, y: 150 },
+      },
+    ),
+  ),
+  workspaceTemplate(
+    'template-three-tier',
+    'Three Tier Web App',
+    'Web, API, and data namespaces split into a classic three-tier topology with explicit tier boundaries.',
+    'EDGE -> WEB -> API -> DATA',
+    templateWorkspace(
+      'Three Tier Platform',
+      'gcp',
+      threeTierNodes,
+      [
+        { id: 'tier-e1', from: 'ingress-three-tier', to: 'frontend-three-tier', type: 'http', latencyBudgetMs: 100, networkPolicy: 'allow' },
+        { id: 'tier-e2', from: 'frontend-three-tier', to: 'api-three-tier', type: 'http', latencyBudgetMs: 150, networkPolicy: 'allow' },
+        { id: 'tier-e3', from: 'api-three-tier', to: 'db-three-tier', type: 'data', latencyBudgetMs: 35, networkPolicy: 'allow' },
+      ],
+      {
+        'ingress-three-tier': { x: 80, y: 120 },
+        'frontend-three-tier': { x: 360, y: 120 },
+        'api-three-tier': { x: 640, y: 120 },
+        'db-three-tier': { x: 920, y: 120 },
+      },
+    ),
+  ),
+  workspaceTemplate(
+    'template-ml-pipeline',
+    'ML Pipeline',
+    'Inference API, async training worker, feature queue, and cache grouped into a single ML cluster.',
+    'API + MQ -> WORKER -> CACHE',
+    templateWorkspace(
+      'ML Pipeline',
+      'azure',
+      mlPipelineNodes,
+      [
+        { id: 'ml-e1', from: 'ingress-ml', to: 'service-inference', type: 'http', latencyBudgetMs: 120, networkPolicy: 'allow' },
+        { id: 'ml-e2', from: 'service-inference', to: 'queue-features', type: 'async', latencyBudgetMs: 350, networkPolicy: 'allow' },
+        { id: 'ml-e3', from: 'worker-training', to: 'queue-features', type: 'async', latencyBudgetMs: 500, networkPolicy: 'allow' },
+        { id: 'ml-e4', from: 'service-inference', to: 'cache-features', type: 'data', latencyBudgetMs: 20, networkPolicy: 'allow' },
+      ],
+      {
+        'ingress-ml': { x: 80, y: 120 },
+        'service-inference': { x: 360, y: 120 },
+        'queue-features': { x: 640, y: 120 },
+        'worker-training': { x: 640, y: 310 },
+        'cache-features': { x: 920, y: 120 },
+      },
+    ),
+  ),
+];
+
 let sequence = 0;
 
 export function createNodeTemplate(type: NodeType, defaultNamespace = 'visual-kubernetes'): ArchitectureNode {
@@ -463,8 +844,12 @@ export function createNodeTemplate(type: NodeType, defaultNamespace = 'visual-ku
             ? 'Worker'
             : type === 'job'
               ? 'Job'
-              : type === 'cronjob'
-                ? 'CronJob'
+            : type === 'cronjob'
+              ? 'CronJob'
+              : type === 'networkPolicy'
+                ? 'NetworkPolicy'
+                : type === 'role'
+                  ? 'Role'
             : type === 'database'
               ? 'Database'
               : type === 'cache'

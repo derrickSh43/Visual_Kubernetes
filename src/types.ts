@@ -1,4 +1,16 @@
-export type NodeType = 'ingress' | 'frontend' | 'gateway' | 'service' | 'worker' | 'database' | 'cache' | 'queue' | 'job' | 'cronjob';
+export type NodeType =
+  | 'ingress'
+  | 'frontend'
+  | 'gateway'
+  | 'service'
+  | 'worker'
+  | 'database'
+  | 'cache'
+  | 'queue'
+  | 'job'
+  | 'cronjob'
+  | 'networkPolicy'
+  | 'role';
 export type EdgeType = 'http' | 'async' | 'data';
 export type PatternType = 'monolith' | 'microservices' | 'event-driven' | 'hybrid';
 export type CloudProvider = 'aws' | 'gcp' | 'azure' | 'generic';
@@ -112,6 +124,25 @@ export interface SecurityConfig {
   seccompProfile: 'RuntimeDefault' | 'Localhost' | 'Unconfined';
 }
 
+export interface NetworkPolicyConfig {
+  targetLabels: EnvironmentVariable[];
+  ingressFromLabels: EnvironmentVariable[];
+  egressToCidrs: string[];
+  allowIngress: boolean;
+  allowEgress: boolean;
+}
+
+export interface RoleRule {
+  apiGroups: string[];
+  resources: string[];
+  verbs: string[];
+}
+
+export interface RoleConfig {
+  serviceAccounts: string[];
+  rules: RoleRule[];
+}
+
 export interface NodeEnvironmentOverride {
   replicas?: number;
   tag?: string;
@@ -145,6 +176,8 @@ export interface ArchitectureNode {
   serviceAccountName: string;
   imagePullSecrets: string[];
   security: SecurityConfig;
+  networkPolicy: NetworkPolicyConfig;
+  role: RoleConfig;
   ingress: IngressConfig;
   environmentOverrides?: Partial<Record<EnvironmentName, NodeEnvironmentOverride>>;
 }
@@ -158,11 +191,21 @@ export interface ArchitectureEdge {
   networkPolicy: NetworkPolicyIntent;
 }
 
+export interface Cluster {
+  id: string;
+  name: string;
+  provider: CloudProvider;
+  region: string;
+  workerCount: number;
+  nodeIds: string[];
+}
+
 export interface ArchitectureModel {
   name: string;
   defaultNamespace: string;
   provider: CloudProvider;
   activeEnvironment: EnvironmentName;
+  clusters: Cluster[];
   nodes: ArchitectureNode[];
   edges: ArchitectureEdge[];
 }
@@ -197,4 +240,23 @@ export interface ExportDocument {
   kind: string;
   name: string;
   yaml: string;
+}
+
+export interface NodeLibraryItem {
+  id: string;
+  type: NodeType;
+  name: string;
+  description: string;
+  notes: string;
+  icon: string;
+  overrides?: Partial<ArchitectureNode>;
+}
+
+export interface GraphTemplate {
+  id: string;
+  name: string;
+  notes: string;
+  thumbnail: string;
+  workspace: WorkspaceState;
+  createdAt?: string;
 }

@@ -2,6 +2,7 @@ import type {
   ArchitectureModel,
   ArchitectureNode,
   CloudProvider,
+  Cluster,
   DeploymentPlan,
   EdgeType,
   EnvironmentVariable,
@@ -27,6 +28,8 @@ const baseCostByType: Record<ArchitectureNode['type'], number> = {
   queue: 110,
   job: 90,
   cronjob: 95,
+  networkPolicy: 0,
+  role: 0,
 };
 
 const defaultStorageClasses = ['standard', 'gp3', 'standard-rwo', 'managed-csi'];
@@ -127,6 +130,20 @@ function namespaceValue(namespace: string) {
   return sanitizeName(namespace) || 'default';
 }
 
+function clustersForModel(model: ArchitectureModel): Cluster[] {
+  return model.clusters ?? [];
+}
+
+function clusterForNode(model: ArchitectureModel, nodeId: string) {
+  return clustersForModel(model).find((cluster) => cluster.nodeIds.includes(nodeId));
+}
+
+function isCrossClusterEdge(model: ArchitectureModel, edge: { from: string; to: string }) {
+  const fromCluster = clusterForNode(model, edge.from);
+  const toCluster = clusterForNode(model, edge.to);
+  return Boolean(fromCluster && toCluster && fromCluster.id !== toCluster.id);
+}
+
 function hasOverrideValue(node: ArchitectureNode, environment: EnvironmentName) {
   const override = node.environmentOverrides?.[environment];
   return Boolean(
@@ -217,16 +234,33 @@ function referencedSecretEntries(node: ArchitectureNode) {
   return node.secretEnv.filter((entry) => entry.source === 'existingSecret');
 }
 
+function isPolicyNode(node: ArchitectureNode) {
+  return node.type === 'networkPolicy' || node.type === 'role';
+}
+
+function hasExplicitRoleForServiceAccount(model: ArchitectureModel, serviceAccountName: string, namespace: string) {
+  return model.nodes.some(
+    (node) =>
+      node.type === 'role' &&
+      namespaceValue(node.namespace) === namespaceValue(namespace) &&
+      node.role.serviceAccounts.includes(serviceAccountName),
+  );
+}
+
+function hasExplicitNetworkPolicies(model: ArchitectureModel) {
+  return model.nodes.some((node) => node.type === 'networkPolicy');
+}
+
 function workloadKindForNode(node: ArchitectureNode) {
   return node.workload?.kind ?? (node.type === 'database' || node.type === 'queue' || node.type === 'cache' ? 'StatefulSet' : 'Deployment');
 }
 
 function shouldEmitService(node: ArchitectureNode) {
-  return !['worker', 'job', 'cronjob'].includes(node.type);
+  return !['worker', 'job', 'cronjob', 'networkPolicy', 'role'].includes(node.type);
 }
 
 function shouldEmitHpa(node: ArchitectureNode) {
-  return node.autoscaling.enabled && workloadKindForNode(node) === 'Deployment';
+  return !isPolicyNode(node) && node.autoscaling.enabled && workloadKindForNode(node) === 'Deployment';
 }
 
 function shouldUseVolumeClaimTemplate(node: ArchitectureNode) {
@@ -472,6 +506,9 @@ export function detectPattern(model: ArchitectureModel): PatternType {
 }
 
 export function inferEdgeType(_fromNode: ArchitectureNode, toNode: ArchitectureNode): EdgeType {
+  if (toNode.type === 'networkPolicy' || toNode.type === 'role') {
+    return 'http';
+  }
   if (toNode.type === 'database' || toNode.type === 'cache') {
     return 'data';
   }
@@ -484,6 +521,10 @@ export function inferEdgeType(_fromNode: ArchitectureNode, toNode: ArchitectureN
 export function canConnectNodes(fromNode: ArchitectureNode, toNode: ArchitectureNode): ConnectionDecision {
   if (fromNode.id === toNode.id) {
     return { allowed: false, reason: 'A node cannot connect to itself.' };
+  }
+
+  if (isPolicyNode(fromNode) || isPolicyNode(toNode)) {
+    return { allowed: false, reason: 'Policy and RBAC nodes are configured through selectors and bindings, not runtime traffic edges.' };
   }
 
   const edgeType = inferEdgeType(fromNode, toNode);
@@ -523,6 +564,7 @@ export function validateArchitecture(model: ArchitectureModel): ValidationIssue[
   const resolvedModel = getResolvedModel(model);
   const issues: ValidationIssue[] = [];
   const knownReferencedSecrets = new Set<string>();
+  const knownNodeIds = new Set(resolvedModel.nodes.map((node) => node.id));
 
   if (resolvedModel.nodes.length === 0) {
     issues.push({ level: 'error', message: 'Add at least one node before generating a deployment plan.' });
@@ -542,6 +584,29 @@ export function validateArchitecture(model: ArchitectureModel): ValidationIssue[
     }
     if (node.namespace !== namespaceValue(node.namespace)) {
       issues.push({ level: 'warning', message: `${node.name} namespace will be normalized to ${namespaceValue(node.namespace)} in exports.` });
+    }
+    if (node.type === 'networkPolicy') {
+      if (node.networkPolicy.targetLabels.length === 0 || node.networkPolicy.targetLabels.some((label) => !label.key.trim() || !label.value.trim())) {
+        issues.push({ level: 'error', message: `${node.name} NetworkPolicy must define at least one target selector label.` });
+      }
+      if (node.networkPolicy.allowIngress && node.networkPolicy.ingressFromLabels.some((label) => !label.key.trim() || !label.value.trim())) {
+        issues.push({ level: 'error', message: `${node.name} NetworkPolicy ingress selectors must include both key and value.` });
+      }
+      continue;
+    }
+    if (node.type === 'role') {
+      if (node.role.serviceAccounts.length === 0) {
+        issues.push({ level: 'error', message: `${node.name} Role must bind to at least one service account.` });
+      }
+      if (node.role.rules.length === 0) {
+        issues.push({ level: 'error', message: `${node.name} Role must define at least one rule.` });
+      }
+      for (const rule of node.role.rules) {
+        if (rule.resources.length === 0 || rule.verbs.length === 0) {
+          issues.push({ level: 'error', message: `${node.name} Role rules must include resources and verbs.` });
+        }
+      }
+      continue;
     }
     if (node.replicas < 1) {
       issues.push({ level: 'error', message: `${node.name} must have at least one replica.` });
@@ -697,6 +762,28 @@ export function validateArchitecture(model: ArchitectureModel): ValidationIssue[
     issues.push({ level: 'error', message: `Duplicate node name detected: ${duplicateName}.` });
   }
 
+  for (const cluster of clustersForModel(resolvedModel)) {
+    if (!cluster.name.trim()) {
+      issues.push({ level: 'error', message: `Cluster ${cluster.id} must have a name.` });
+    }
+    if (!cluster.region.trim()) {
+      issues.push({ level: 'error', message: `${cluster.name || cluster.id} must define a region.` });
+    }
+    if (cluster.workerCount < 1) {
+      issues.push({ level: 'error', message: `${cluster.name || cluster.id} must have at least one worker.` });
+    }
+    for (const nodeId of cluster.nodeIds) {
+      if (!knownNodeIds.has(nodeId)) {
+        issues.push({ level: 'error', message: `${cluster.name || cluster.id} references missing node ${nodeId}.` });
+      }
+    }
+  }
+
+  const unassignedNodes = resolvedModel.nodes.filter((node) => !clusterForNode(resolvedModel, node.id));
+  for (const node of unassignedNodes) {
+    issues.push({ level: 'warning', message: `${node.name} is not assigned to a cluster.` });
+  }
+
   for (const edge of resolvedModel.edges) {
     const fromNode = getNode(resolvedModel, edge.from);
     const toNode = getNode(resolvedModel, edge.to);
@@ -715,6 +802,9 @@ export function validateArchitecture(model: ArchitectureModel): ValidationIssue[
     }
     if (edge.networkPolicy === 'allow' && namespaceValue(fromNode.namespace) !== namespaceValue(toNode.namespace)) {
       issues.push({ level: 'warning', message: `${fromNode.name} to ${toNode.name} crosses namespaces; verify namespace labels exist for NetworkPolicy selection.` });
+    }
+    if (isCrossClusterEdge(resolvedModel, edge)) {
+      issues.push({ level: 'warning', message: `${fromNode.name} to ${toNode.name} crosses clusters; export marks this edge for external routing review.` });
     }
     if (edge.type !== inferEdgeType(fromNode, toNode)) {
       issues.push({ level: 'warning', message: `${fromNode.name} to ${toNode.name} is typed ${edge.type}, but the target suggests ${inferEdgeType(fromNode, toNode)}.` });
@@ -759,8 +849,15 @@ export function generateDeploymentPlan(model: ArchitectureModel): DeploymentPlan
 
   const namespaces = [...new Set(resolvedModel.nodes.map((node) => node.namespace))];
   const kubernetesObjects = [
+    ...clustersForModel(resolvedModel).map((cluster) => `Cluster/${cluster.name}/${cluster.region}/${cluster.workerCount} workers`),
     ...namespaces.map((namespace) => `Namespace/${namespace}`),
     ...resolvedModel.nodes.flatMap((node) => {
+      if (node.type === 'networkPolicy') {
+        return [`NetworkPolicy/${node.namespace}/${node.name}`];
+      }
+      if (node.type === 'role') {
+        return [`Role/${node.name}`, `RoleBinding/${node.name}`];
+      }
       const inlineSecrets = inlineSecretEntries(node);
       const referencedSecrets = referencedSecretEntries(node);
       const workloadKind = workloadKindForNode(node);
@@ -804,12 +901,111 @@ export function generateDeploymentPlan(model: ArchitectureModel): DeploymentPlan
       `${resolvedModel.nodes.length} components modeled with ${resolvedModel.edges.length} validated relationships for ${resolvedModel.activeEnvironment}.`,
       `Pattern detection suggests a ${pattern} architecture with environment-aware defaults.`,
       `${resolvedModel.provider} provider defaults apply ${providerProfiles[resolvedModel.provider].storageClassName} storage and ${providerProfiles[resolvedModel.provider].ingressClassName} ingress.`,
+      `${clustersForModel(resolvedModel).length} cluster group${clustersForModel(resolvedModel).length === 1 ? '' : 's'} modeled for provider, region, worker count, and overlay export.`,
       'Namespaces, service accounts, graph-derived dependency config, storage, ingress, scaling, and environment overlays are carried into export output.',
     ],
     warnings: validateArchitecture(model)
       .filter((issue) => issue.level === 'warning')
       .map((issue) => issue.message),
   };
+}
+
+function selectorLabelLines(labels: EnvironmentVariable[], spaces: number) {
+  return indent(labels.map((label) => `${label.key}: ${label.value}`), spaces);
+}
+
+function explicitNetworkPolicyDocument(node: ArchitectureNode): ExportDocument {
+  const namespace = namespaceValue(node.namespace);
+  const name = sanitizeName(node.name);
+  const policyTypes = [
+    ...(node.networkPolicy.allowIngress ? ['Ingress'] : []),
+    ...(node.networkPolicy.allowEgress ? ['Egress'] : []),
+  ];
+  const ingressLines =
+    node.networkPolicy.allowIngress
+      ? [
+          '  ingress:',
+          '    - from:',
+          ...(node.networkPolicy.ingressFromLabels.length > 0
+            ? [
+                '        - podSelector:',
+                '            matchLabels:',
+                ...selectorLabelLines(node.networkPolicy.ingressFromLabels, 14),
+              ]
+            : ['        - namespaceSelector: {}']),
+        ]
+      : [];
+  const egressLines =
+    node.networkPolicy.allowEgress && node.networkPolicy.egressToCidrs.length > 0
+      ? [
+          '  egress:',
+          '    - to:',
+          ...node.networkPolicy.egressToCidrs.flatMap((cidr) => ['        - ipBlock:', `            cidr: ${cidr}`]),
+        ]
+      : [];
+
+  return {
+    kind: 'NetworkPolicy',
+    name: `${namespace}-${name}`,
+    yaml: [
+      'apiVersion: networking.k8s.io/v1',
+      'kind: NetworkPolicy',
+      'metadata:',
+      `  name: ${name}`,
+      `  namespace: ${namespace}`,
+      'spec:',
+      '  podSelector:',
+      '    matchLabels:',
+      ...selectorLabelLines(node.networkPolicy.targetLabels, 6),
+      '  policyTypes:',
+      ...(policyTypes.length > 0 ? policyTypes.map((type) => `    - ${type}`) : ['    - Ingress']),
+      ...ingressLines,
+      ...egressLines,
+    ].join('\n'),
+  };
+}
+
+function explicitRoleDocuments(node: ArchitectureNode): ExportDocument[] {
+  const namespace = namespaceValue(node.namespace);
+  const name = sanitizeName(node.name);
+  const roleYaml = [
+    'apiVersion: rbac.authorization.k8s.io/v1',
+    'kind: Role',
+    'metadata:',
+    `  name: ${name}`,
+    `  namespace: ${namespace}`,
+    'rules:',
+    ...node.role.rules.flatMap((rule) => [
+      '  - apiGroups:',
+      ...(rule.apiGroups.length > 0 ? rule.apiGroups.map((apiGroup) => `      - "${apiGroup}"`) : ['      - ""']),
+      '    resources:',
+      ...rule.resources.map((resource) => `      - "${resource}"`),
+      '    verbs:',
+      ...rule.verbs.map((verb) => `      - ${verb}`),
+    ]),
+  ].join('\n');
+  const bindingYaml = [
+    'apiVersion: rbac.authorization.k8s.io/v1',
+    'kind: RoleBinding',
+    'metadata:',
+    `  name: ${name}`,
+    `  namespace: ${namespace}`,
+    'subjects:',
+    ...node.role.serviceAccounts.flatMap((serviceAccount) => [
+      '  - kind: ServiceAccount',
+      `    name: ${serviceAccount}`,
+      `    namespace: ${namespace}`,
+    ]),
+    'roleRef:',
+    '  apiGroup: rbac.authorization.k8s.io',
+    '  kind: Role',
+    `  name: ${name}`,
+  ].join('\n');
+
+  return [
+    { kind: 'Role', name: `${namespace}-${name}`, yaml: roleYaml },
+    { kind: 'RoleBinding', name: `${namespace}-${name}`, yaml: bindingYaml },
+  ];
 }
 
 export function generateKubernetesDocuments(model: ArchitectureModel): ExportDocument[] {
@@ -822,6 +1018,15 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
   }));
 
   for (const node of resolvedModel.nodes) {
+    if (node.type === 'networkPolicy') {
+      documents.push(explicitNetworkPolicyDocument(node));
+      continue;
+    }
+    if (node.type === 'role') {
+      documents.push(...explicitRoleDocuments(node));
+      continue;
+    }
+
     const namespace = sanitizeName(node.namespace) || 'default';
     const appName = sanitizeName(node.name);
     const labels = indent([`app: ${appName}`, `component: ${node.type}`], 8);
@@ -837,46 +1042,48 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
     });
 
     const rbacResources = ['"configmaps"', ...(inlineSecrets.length > 0 || referencedSecrets.length > 0 ? ['"secrets"'] : [])];
-    documents.push({
-      kind: 'Role',
-      name: `${namespace}-${roleName(node)}`,
-      yaml: [
-        'apiVersion: rbac.authorization.k8s.io/v1',
-        'kind: Role',
-        'metadata:',
-        `  name: ${roleName(node)}`,
-        `  namespace: ${namespace}`,
-        'rules:',
-        '  - apiGroups:',
-        '      - ""',
-        '    resources:',
-        ...rbacResources.map((resource) => `      - ${resource}`),
-        '    verbs:',
-        '      - get',
-        '      - list',
-        '      - watch',
-      ].join('\n'),
-    });
+    if (!hasExplicitRoleForServiceAccount(resolvedModel, node.serviceAccountName, namespace)) {
+      documents.push({
+        kind: 'Role',
+        name: `${namespace}-${roleName(node)}`,
+        yaml: [
+          'apiVersion: rbac.authorization.k8s.io/v1',
+          'kind: Role',
+          'metadata:',
+          `  name: ${roleName(node)}`,
+          `  namespace: ${namespace}`,
+          'rules:',
+          '  - apiGroups:',
+          '      - ""',
+          '    resources:',
+          ...rbacResources.map((resource) => `      - ${resource}`),
+          '    verbs:',
+          '      - get',
+          '      - list',
+          '      - watch',
+        ].join('\n'),
+      });
 
-    documents.push({
-      kind: 'RoleBinding',
-      name: `${namespace}-${roleName(node)}`,
-      yaml: [
-        'apiVersion: rbac.authorization.k8s.io/v1',
-        'kind: RoleBinding',
-        'metadata:',
-        `  name: ${roleName(node)}`,
-        `  namespace: ${namespace}`,
-        'subjects:',
-        '  - kind: ServiceAccount',
-        `    name: ${node.serviceAccountName}`,
-        `    namespace: ${namespace}`,
-        'roleRef:',
-        '  apiGroup: rbac.authorization.k8s.io',
-        '  kind: Role',
-        `  name: ${roleName(node)}`,
-      ].join('\n'),
-    });
+      documents.push({
+        kind: 'RoleBinding',
+        name: `${namespace}-${roleName(node)}`,
+        yaml: [
+          'apiVersion: rbac.authorization.k8s.io/v1',
+          'kind: RoleBinding',
+          'metadata:',
+          `  name: ${roleName(node)}`,
+          `  namespace: ${namespace}`,
+          'subjects:',
+          '  - kind: ServiceAccount',
+          `    name: ${node.serviceAccountName}`,
+          `    namespace: ${namespace}`,
+          'roleRef:',
+          '  apiGroup: rbac.authorization.k8s.io',
+          '  kind: Role',
+          `  name: ${roleName(node)}`,
+        ].join('\n'),
+      });
+    }
 
     if (mergedEnv.length > 0) {
       documents.push({
@@ -1188,6 +1395,10 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
     });
   }
 
+  if (hasExplicitNetworkPolicies(resolvedModel)) {
+    return documents;
+  }
+
   for (const edge of resolvedModel.edges) {
     if (edge.networkPolicy === 'deny') {
       continue;
@@ -1202,6 +1413,7 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
     const fromNs = sanitizeName(fromNode.namespace) || 'default';
     const toNs = sanitizeName(toNode.namespace) || 'default';
     const policyName = `allow-${fromApp}-to-${toApp}`;
+    const crossCluster = isCrossClusterEdge(resolvedModel, edge);
 
     const ingressFrom =
       fromNs !== toNs
@@ -1228,6 +1440,14 @@ export function generateKubernetesDocuments(model: ArchitectureModel): ExportDoc
         'metadata:',
         `  name: ${policyName}`,
         `  namespace: ${toNs}`,
+        ...(crossCluster
+          ? [
+              '  annotations:',
+              '    visual-kubernetes.io/cross-cluster-edge: "true"',
+              `    visual-kubernetes.io/source-cluster: "${clusterForNode(resolvedModel, fromNode.id)?.name ?? 'unassigned'}"`,
+              `    visual-kubernetes.io/target-cluster: "${clusterForNode(resolvedModel, toNode.id)?.name ?? 'unassigned'}"`,
+            ]
+          : []),
         'spec:',
         '  podSelector:',
         '    matchLabels:',
@@ -1331,6 +1551,7 @@ export function generateProjectFiles(model: ArchitectureModel) {
   const documents = generateKubernetesDocuments(model);
   const namespaces = [...new Set(documents.map((document) => documentNamespace(document)))];
   const environment = resolvedModel.activeEnvironment;
+  const clusters = clustersForModel(resolvedModel);
   const manifestFiles = documents.map((document) => {
     const namespace = documentNamespace(document);
     const fileName = `${fileSafeName(document.kind)}-${fileSafeName(document.name)}.yaml`;
@@ -1349,6 +1570,54 @@ export function generateProjectFiles(model: ArchitectureModel) {
       content: ['apiVersion: kustomize.config.k8s.io/v1beta1', 'kind: Kustomization', 'resources:', ...resources].join('\n'),
     };
   });
+  const clusterFiles = clusters.flatMap((cluster) => {
+    const clusterName = fileSafeName(cluster.name);
+    const clusterNamespaces = [
+      ...new Set(
+        resolvedModel.nodes
+          .filter((node) => cluster.nodeIds.includes(node.id))
+          .map((node) => namespaceValue(node.namespace)),
+      ),
+    ];
+    const resources = clusterNamespaces.length > 0
+      ? clusterNamespaces.map((namespace) => `  - ../../namespaces/${namespace}`)
+      : ['  # Assign nodes to this cluster to include namespace overlays.'];
+
+    return [
+      {
+        path: `k8s/${environment}/clusters/${clusterName}/kustomization.yaml`,
+        content: ['apiVersion: kustomize.config.k8s.io/v1beta1', 'kind: Kustomization', 'resources:', ...resources].join('\n'),
+      },
+      {
+        path: `k8s/${environment}/clusters/${clusterName}/kubeconfig-context.env`,
+        content: [
+          `KUBE_CONTEXT=${fileSafeName(cluster.name)}-${environment}`,
+          `PROVIDER=${cluster.provider}`,
+          `REGION=${cluster.region}`,
+          `WORKER_COUNT=${cluster.workerCount}`,
+          '',
+        ].join('\n'),
+      },
+      {
+        path: `k8s/${environment}/clusters/${clusterName}/README.md`,
+        content: [
+          `# Cluster ${cluster.name}`,
+          '',
+          `Provider: ${cluster.provider}`,
+          `Region: ${cluster.region}`,
+          `Workers: ${cluster.workerCount}`,
+          `Assigned nodes: ${cluster.nodeIds.length}`,
+          '',
+          'Apply this cluster overlay with:',
+          '',
+          '```sh',
+          `kubectl --context ${fileSafeName(cluster.name)}-${environment} apply -k k8s/${environment}/clusters/${clusterName}`,
+          '```',
+          '',
+        ].join('\n'),
+      },
+    ];
+  });
   const terraformManifestFiles = documents.map((document, index) => ({
     path: `terraform/${environment}/manifests/${String(index + 1).padStart(3, '0')}-${fileSafeName(document.kind)}-${fileSafeName(document.name)}.tf`,
     content: `${terraformResourceForDocument(document, index)}\n`,
@@ -1359,6 +1628,7 @@ export function generateProjectFiles(model: ArchitectureModel) {
       path: `k8s/${environment}/kustomization.yaml`,
       content: ['apiVersion: kustomize.config.k8s.io/v1beta1', 'kind: Kustomization', 'resources:', ...namespaces.map((namespace) => `  - namespaces/${namespace}`)].join('\n'),
     },
+    ...clusterFiles,
     ...namespaceKustomizations,
     ...manifestFiles,
     ...namespaces.map((namespace) => ({
@@ -1385,11 +1655,13 @@ export function generateProjectFiles(model: ArchitectureModel) {
         `Storage class default: ${providerProfiles[resolvedModel.provider].storageClassName}`,
         `Ingress class default: ${providerProfiles[resolvedModel.provider].ingressClassName}`,
         `Service exposure: ${providerProfiles[resolvedModel.provider].loadBalancerMode}`,
+        `Clusters: ${clusters.length}`,
         '',
         '## Kubernetes',
         `- Environment root: k8s/${environment}`,
         `- Apply all manifests: kubectl apply -k k8s/${environment}`,
         `- Namespace-specific manifests are grouped under k8s/${environment}/namespaces/<namespace>.`,
+        `- Per-cluster overlays are grouped under k8s/${environment}/clusters/<cluster>.`,
         '',
         '## Terraform',
         `- Terraform root: terraform/${environment}`,

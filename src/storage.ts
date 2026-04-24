@@ -10,10 +10,17 @@ import type {
   SecurityConfig,
   ServiceConfig,
   StorageConfig,
+  NetworkPolicyConfig,
+  RoleConfig,
   WorkspaceState,
+  Cluster,
+  GraphTemplate,
+  NodeLibraryItem,
 } from './types';
 
 export const WORKSPACE_STORAGE_KEY = 'visual-kubernetes/workspace';
+export const NODE_LIBRARY_STORAGE_KEY = 'visual-kubernetes/node-library/custom';
+export const GRAPH_TEMPLATE_STORAGE_KEY = 'visual-kubernetes/templates/custom';
 
 function defaultProbeForNode(node: ArchitectureNode, label: 'readiness' | 'liveness' | 'startup', port: number): ProbeConfig {
   const probeType = node.type === 'database' || node.type === 'queue' || node.type === 'cache' ? 'tcp' : 'http';
@@ -54,9 +61,9 @@ function defaultWorkload(node: ArchitectureNode): WorkloadConfig {
       ? 'StatefulSet'
       : node.type === 'job'
         ? 'Job'
-        : node.type === 'cronjob'
-          ? 'CronJob'
-          : 'Deployment';
+      : node.type === 'cronjob'
+        ? 'CronJob'
+        : 'Deployment';
 
   return {
     kind,
@@ -68,6 +75,23 @@ function defaultWorkload(node: ArchitectureNode): WorkloadConfig {
     command: [],
     args: [],
     terminationGracePeriodSeconds: node.type === 'database' || node.type === 'queue' ? 60 : kind === 'Job' || kind === 'CronJob' ? 30 : 45,
+  };
+}
+
+function defaultNetworkPolicy(node: ArchitectureNode): NetworkPolicyConfig {
+  return {
+    targetLabels: [{ key: 'app', value: node.type === 'networkPolicy' ? 'replace-me' : '' }],
+    ingressFromLabels: [],
+    egressToCidrs: [],
+    allowIngress: true,
+    allowEgress: false,
+  };
+}
+
+function defaultRole(node: ArchitectureNode): RoleConfig {
+  return {
+    serviceAccounts: node.type === 'role' ? [node.serviceAccountName ?? `${node.id}-sa`] : [],
+    rules: [{ apiGroups: [''], resources: ['configmaps'], verbs: ['get', 'list', 'watch'] }],
   };
 }
 
@@ -161,6 +185,8 @@ function hydrateNode(node: ArchitectureNode, defaultNamespace: string): Architec
     serviceAccountName: node.serviceAccountName ?? `${node.id}-sa`,
     imagePullSecrets: node.imagePullSecrets ?? [],
     security: node.security ?? defaultSecurity(node),
+    networkPolicy: { ...defaultNetworkPolicy(node), ...node.networkPolicy },
+    role: { ...defaultRole(node), ...node.role },
     ingress: { ...defaultIngress(node), ...node.ingress },
     environmentOverrides: node.environmentOverrides ?? {},
   };
@@ -171,6 +197,32 @@ function hydrateEdge(edge: ArchitectureEdge): ArchitectureEdge {
     ...edge,
     networkPolicy: edge.networkPolicy ?? 'allow',
   };
+}
+
+function hydrateClusters(parsed: WorkspaceState): Cluster[] {
+  const nodes = parsed.model.nodes ?? [];
+  if (parsed.model.clusters?.length) {
+    const nodeIds = new Set(nodes.map((node) => node.id));
+    return parsed.model.clusters.map((cluster) => ({
+      id: cluster.id,
+      name: cluster.name || 'Primary Cluster',
+      provider: cluster.provider ?? parsed.model.provider ?? 'generic',
+      region: cluster.region || 'us-east-1',
+      workerCount: Math.max(1, cluster.workerCount ?? 3),
+      nodeIds: (cluster.nodeIds ?? []).filter((nodeId) => nodeIds.has(nodeId)),
+    }));
+  }
+
+  return [
+    {
+      id: 'cluster-primary',
+      name: 'Primary Cluster',
+      provider: parsed.model.provider ?? 'generic',
+      region: parsed.model.provider === 'azure' ? 'eastus' : parsed.model.provider === 'gcp' ? 'us-central1' : 'us-east-1',
+      workerCount: 3,
+      nodeIds: nodes.map((node) => node.id),
+    },
+  ];
 }
 
 export function loadWorkspace(): WorkspaceState {
@@ -197,6 +249,7 @@ export function loadWorkspace(): WorkspaceState {
         defaultNamespace,
         provider: parsed.model.provider ?? 'generic',
         activeEnvironment: parsed.model.activeEnvironment ?? 'prod',
+        clusters: hydrateClusters(parsed),
         nodes: parsed.model.nodes.map((node) => hydrateNode(node as ArchitectureNode, defaultNamespace)),
         edges: parsed.model.edges.map((edge) => hydrateEdge(edge as ArchitectureEdge)),
       },
@@ -212,4 +265,62 @@ export function saveWorkspace(workspace: WorkspaceState) {
   }
 
   window.localStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(workspace));
+}
+
+export function loadCustomNodeLibrary(): NodeLibraryItem[] {
+  if (typeof window === 'undefined') {
+    return [];
+  }
+
+  const raw = window.localStorage.getItem(NODE_LIBRARY_STORAGE_KEY);
+  if (!raw) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as NodeLibraryItem[];
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter((item) => item.id && item.type && item.name);
+  } catch {
+    return [];
+  }
+}
+
+export function saveCustomNodeLibrary(items: NodeLibraryItem[]) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  window.localStorage.setItem(NODE_LIBRARY_STORAGE_KEY, JSON.stringify(items));
+}
+
+export function loadCustomGraphTemplates(): GraphTemplate[] {
+  if (typeof window === 'undefined') {
+    return [];
+  }
+
+  const raw = window.localStorage.getItem(GRAPH_TEMPLATE_STORAGE_KEY);
+  if (!raw) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as GraphTemplate[];
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter((template) => template.id && template.name && template.workspace?.model?.nodes && template.workspace?.layout);
+  } catch {
+    return [];
+  }
+}
+
+export function saveCustomGraphTemplates(templates: GraphTemplate[]) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  window.localStorage.setItem(GRAPH_TEMPLATE_STORAGE_KEY, JSON.stringify(templates));
 }

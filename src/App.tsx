@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import JSZip from 'jszip';
-import { availableNodeTypes, createNodeTemplate, starterWorkspace, supportedEnvironments } from './data';
+import { builtinGraphTemplates, coreNodeLibrary, createNodeTemplate, starterWorkspace, supportedEnvironments } from './data';
 import {
   canConnectNodes,
   detectPattern,
@@ -14,8 +14,15 @@ import {
   inferEdgeType,
   validateArchitecture,
 } from './engine';
-import { loadWorkspace, saveWorkspace } from './storage';
-import type { ArchitectureEdge, ArchitectureNode, EdgeType, EnvironmentName, NetworkPolicyIntent, NodeType, WorkspaceState } from './types';
+import {
+  loadCustomGraphTemplates,
+  loadCustomNodeLibrary,
+  loadWorkspace,
+  saveCustomGraphTemplates,
+  saveCustomNodeLibrary,
+  saveWorkspace,
+} from './storage';
+import type { ArchitectureEdge, ArchitectureNode, CloudProvider, Cluster, EdgeType, EnvironmentName, GraphTemplate, NetworkPolicyIntent, NodeLibraryItem, NodeType, WorkspaceState } from './types';
 
 const nodeColors: Record<NodeType, string> = {
   ingress: '#4dabf7',
@@ -28,6 +35,8 @@ const nodeColors: Record<NodeType, string> = {
   queue: '#12b886',
   job: '#ffa94d',
   cronjob: '#ff922b',
+  networkPolicy: '#15aabf',
+  role: '#d9480f',
 };
 
 const canvasBounds = {
@@ -35,12 +44,31 @@ const canvasBounds = {
   height: 900,
   nodeWidth: 248,
   nodeHeight: 154,
+  padding: 240,
+  minZoom: 0.35,
+  maxZoom: 2.25,
 };
 
 const nodePortOffsetY = 56;
 const nodePortInset = 12;
-const editorMenus = ['File', 'Edit', 'Asset', 'View', 'Graph', 'Tools', 'Help'];
-const actionBarItems = ['Compile', 'Save', 'Browse', 'Diff', 'Find', 'Blueprint Settings'];
+const clusterPadding = 58;
+const editorMenus = [
+  { label: 'File', commands: 'New / Open / Save / Save As / Import YAML / Export ZIP / Recent' },
+  { label: 'Edit', commands: 'Undo / Redo / Copy / Paste / Duplicate / Select All / Find' },
+  { label: 'Asset', commands: 'Node Library / Templates / Import Asset' },
+  { label: 'View', commands: 'Fit to Content / Zoom 100% / Toggle Palette / Toggle Inspector / Toggle Dock / Grid' },
+  { label: 'Graph', commands: 'Validate / Auto-layout / Detect Pattern / Edge Filters' },
+  { label: 'Tools', commands: 'Compile / Simulate / Diff / Generate Docs' },
+  { label: 'Help', commands: 'Shortcuts / Docs / About' },
+];
+const actionBarItems = [
+  { label: 'Compile', icon: 'CHK', intent: 'Validate graph and refresh YAML preview' },
+  { label: 'Save', icon: 'SAV', intent: 'Create a local snapshot' },
+  { label: 'Browse', icon: 'LIB', intent: 'Open templates and node library browsing' },
+  { label: 'Diff', icon: 'DIF', intent: 'Compare current graph against a saved snapshot' },
+  { label: 'Find', icon: 'FND', intent: 'Fuzzy-search nodes, edges, and generated resources' },
+  { label: 'Blueprint Settings', icon: 'SET', intent: 'Edit stack-wide defaults' },
+];
 const workbenchTabs = ['Viewport', 'Cluster Graph', 'Runtime Model'];
 
 const nodeBehaviorCopy: Record<NodeType, string> = {
@@ -54,10 +82,16 @@ const nodeBehaviorCopy: Record<NodeType, string> = {
   queue: 'Stateful queue: emits StatefulSet, Service, durable storage, and async dependency endpoints.',
   job: 'One-time batch workload: emits Job only; it can consume dependencies but cannot receive runtime traffic.',
   cronjob: 'Scheduled batch workload: emits CronJob only; it can consume dependencies but cannot receive runtime traffic.',
+  networkPolicy: 'Explicit traffic policy: emits a NetworkPolicy from selector labels instead of edge-inferred policy.',
+  role: 'Explicit RBAC policy: emits Role and RoleBinding for selected service accounts.',
 };
 
 function environmentLabel(environment: EnvironmentName) {
   return environment === 'prod' ? 'Prod' : environment === 'stage' ? 'Stage' : 'Dev';
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
 }
 
 function nextLayoutPosition(count: number) {
@@ -67,6 +101,44 @@ function nextLayoutPosition(count: number) {
     x: 80 + column * 280,
     y: 100 + row * 180,
   };
+}
+
+function providerRegionDefault(provider: CloudProvider) {
+  if (provider === 'gcp') return 'us-central1';
+  if (provider === 'azure') return 'eastus';
+  if (provider === 'generic') return 'local';
+  return 'us-east-1';
+}
+
+function clusterBounds(cluster: Cluster, layout: WorkspaceState['layout'], excludeNodeId?: string) {
+  const positions = cluster.nodeIds
+    .filter((nodeId) => nodeId !== excludeNodeId)
+    .map((nodeId) => layout[nodeId])
+    .filter(Boolean);
+
+  if (positions.length === 0) {
+    return null;
+  }
+
+  const minX = Math.min(...positions.map((position) => position.x));
+  const minY = Math.min(...positions.map((position) => position.y));
+  const maxX = Math.max(...positions.map((position) => position.x + canvasBounds.nodeWidth));
+  const maxY = Math.max(...positions.map((position) => position.y + canvasBounds.nodeHeight));
+
+  return {
+    x: minX - clusterPadding,
+    y: minY - clusterPadding,
+    width: maxX - minX + clusterPadding * 2,
+    height: maxY - minY + clusterPadding * 2,
+  };
+}
+
+function pointInsideRect(point: { x: number; y: number }, rect: { x: number; y: number; width: number; height: number }) {
+  return point.x >= rect.x && point.x <= rect.x + rect.width && point.y >= rect.y && point.y <= rect.y + rect.height;
+}
+
+function cloneWorkspace(workspace: WorkspaceState): WorkspaceState {
+  return JSON.parse(JSON.stringify(workspace)) as WorkspaceState;
 }
 
 function formatSecretEntry(entry: ArchitectureNode['secretEnv'][number]) {
@@ -109,6 +181,40 @@ function parseListInput(input: string) {
     .filter(Boolean);
 }
 
+function formatKeyValueEntries(entries: Array<{ key: string; value: string }>) {
+  return entries.map((entry) => `${entry.key}=${entry.value}`).join('\n');
+}
+
+function parseKeyValueEntries(input: string) {
+  return input
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [key, ...rest] = line.split('=');
+      return { key: key.trim(), value: rest.join('=').trim() };
+    });
+}
+
+function formatRoleRules(rules: ArchitectureNode['role']['rules']) {
+  return rules.map((rule) => `${rule.apiGroups.join(',')}|${rule.resources.join(',')}|${rule.verbs.join(',')}`).join('\n');
+}
+
+function parseRoleRules(input: string): ArchitectureNode['role']['rules'] {
+  return input
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [apiGroups = '', resources = '', verbs = ''] = line.split('|');
+      return {
+        apiGroups: apiGroups.split(',').map((entry) => entry.trim()),
+        resources: resources.split(',').map((entry) => entry.trim()).filter(Boolean),
+        verbs: verbs.split(',').map((entry) => entry.trim()).filter(Boolean),
+      };
+    });
+}
+
 export function App() {
   const [workspace, setWorkspace] = useState<WorkspaceState>(() => loadWorkspace());
   const [selectedNodeId, setSelectedNodeId] = useState(workspace.model.nodes[0]?.id ?? '');
@@ -118,8 +224,20 @@ export function App() {
   const [rightRailWidth, setRightRailWidth] = useState(420);
   const [exportMode, setExportMode] = useState<'yaml' | 'terraform'>('yaml');
   const [dockHeight, setDockHeight] = useState(320);
-  const [newNodeType, setNewNodeType] = useState<NodeType>('service');
+  const [selectedClusterId, setSelectedClusterId] = useState(workspace.model.clusters[0]?.id ?? '');
+  const [libraryTab, setLibraryTab] = useState<'core' | 'custom'>('core');
+  const [selectedLibraryItemId, setSelectedLibraryItemId] = useState(coreNodeLibrary[0]?.id ?? '');
+  const [customNodeLibrary, setCustomNodeLibrary] = useState<NodeLibraryItem[]>(() => loadCustomNodeLibrary());
+  const [templatesOpen, setTemplatesOpen] = useState(false);
+  const [templateTab, setTemplateTab] = useState<'builtin' | 'custom'>('builtin');
+  const [customGraphTemplates, setCustomGraphTemplates] = useState<GraphTemplate[]>(() => loadCustomGraphTemplates());
+  const [selectedTemplateId, setSelectedTemplateId] = useState(builtinGraphTemplates[0]?.id ?? '');
+  const [templateSaveName, setTemplateSaveName] = useState('Current graph');
+  const [templateSaveNotes, setTemplateSaveNotes] = useState('Saved from the current workspace.');
   const [canvasConnectMode, setCanvasConnectMode] = useState(false);
+  const [canvasViewport, setCanvasViewport] = useState({ x: 0, y: 0, scale: 1 });
+  const [spacePressed, setSpacePressed] = useState(false);
+  const [canvasPanning, setCanvasPanning] = useState(false);
   const [dragConnection, setDragConnection] = useState<{ fromId: string; x: number; y: number; hoveredNodeId: string | null } | null>(null);
   const [connectionMessage, setConnectionMessage] = useState<{ tone: 'neutral' | 'success' | 'error'; text: string }>({
     tone: 'neutral',
@@ -137,16 +255,34 @@ export function App() {
   const dockResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const leftRailResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const rightRailResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  const canvasPanRef = useRef<{ pointerId: number; startX: number; startY: number; viewportX: number; viewportY: number } | null>(null);
+  const canvasSvgRef = useRef<SVGSVGElement | null>(null);
   const edgeSequenceRef = useRef(0);
+  const librarySequenceRef = useRef(0);
+  const templateSequenceRef = useRef(0);
 
   const model = workspace.model;
   const resolvedModel = useMemo(() => getResolvedModel(model), [model]);
   const layout = workspace.layout;
+  const virtualCanvas = useMemo(() => {
+    const positions = Object.values(layout);
+    if (positions.length === 0) {
+      return { width: canvasBounds.width, height: canvasBounds.height };
+    }
+
+    const maxX = Math.max(...positions.map((position) => position.x + canvasBounds.nodeWidth + canvasBounds.padding));
+    const maxY = Math.max(...positions.map((position) => position.y + canvasBounds.nodeHeight + canvasBounds.padding));
+    return {
+      width: Math.max(canvasBounds.width, Math.ceil(maxX)),
+      height: Math.max(canvasBounds.height, Math.ceil(maxY)),
+    };
+  }, [layout]);
   const validationIssues = useMemo(() => validateArchitecture(model), [model]);
   const deploymentPlan = useMemo(() => generateDeploymentPlan(model), [model]);
   const yamlOutput = useMemo(() => generateKubernetesYaml(model), [model]);
   const terraformOutput = useMemo(() => generateTerraform(model), [model]);
   const selectedNode = model.nodes.find((node) => node.id === selectedNodeId) ?? model.nodes[0];
+  const selectedCluster = model.clusters.find((cluster) => cluster.id === selectedClusterId) ?? model.clusters[0];
   const selectedNodeResolved = selectedNode ? resolvedModel.nodes.find((node) => node.id === selectedNode.id) : undefined;
   const derivedSelectedNodeEnv = useMemo(() => (selectedNode ? getDerivedEnvironmentVariables(model, selectedNode.id) : []), [model, selectedNode]);
   const providerProfile = useMemo(() => getProviderProfile(model.provider), [model.provider]);
@@ -162,10 +298,32 @@ export function App() {
       .filter((entry) => entry.decision.allowed);
   }, [edgeDraft.from, model.nodes]);
   const selectedNodeBehavior = selectedNode ? nodeBehaviorCopy[selectedNode.type] : '';
+  const activeLibraryItems = libraryTab === 'core' ? coreNodeLibrary : customNodeLibrary;
+  const selectedLibraryItem = activeLibraryItems.find((item) => item.id === selectedLibraryItemId) ?? activeLibraryItems[0] ?? coreNodeLibrary[0];
+  const activeGraphTemplates = templateTab === 'builtin' ? builtinGraphTemplates : customGraphTemplates;
+  const selectedGraphTemplate = activeGraphTemplates.find((template) => template.id === selectedTemplateId) ?? activeGraphTemplates[0] ?? builtinGraphTemplates[0];
+
+  const clusterSummaries = useMemo(
+    () =>
+      model.clusters.map((cluster) => ({
+        cluster,
+        bounds: clusterBounds(cluster, layout),
+        nodes: model.nodes.filter((node) => cluster.nodeIds.includes(node.id)),
+      })),
+    [layout, model.clusters, model.nodes],
+  );
 
   useEffect(() => {
     saveWorkspace(workspace);
   }, [workspace]);
+
+  useEffect(() => {
+    saveCustomNodeLibrary(customNodeLibrary);
+  }, [customNodeLibrary]);
+
+  useEffect(() => {
+    saveCustomGraphTemplates(customGraphTemplates);
+  }, [customGraphTemplates]);
 
   useEffect(() => {
     function handleWindowPointerMove(event: PointerEvent) {
@@ -200,6 +358,28 @@ export function App() {
     };
   }, []);
 
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.code === 'Space') {
+        setSpacePressed(true);
+      }
+    }
+
+    function handleKeyUp(event: KeyboardEvent) {
+      if (event.code === 'Space') {
+        setSpacePressed(false);
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, []);
+
   function updateModel(patch: Partial<WorkspaceState['model']>) {
     setWorkspace((current) => ({
       ...current,
@@ -208,6 +388,54 @@ export function App() {
         ...patch,
       },
     }));
+  }
+
+  function updateCluster(clusterId: string, patch: Partial<Cluster>) {
+    setWorkspace((current) => ({
+      ...current,
+      model: {
+        ...current.model,
+        clusters: current.model.clusters.map((cluster) => (cluster.id === clusterId ? { ...cluster, ...patch } : cluster)),
+      },
+    }));
+  }
+
+  function addCluster() {
+    const id = `cluster-${model.clusters.length + 1}`;
+    const cluster: Cluster = {
+      id,
+      name: `Cluster ${model.clusters.length + 1}`,
+      provider: model.provider,
+      region: providerRegionDefault(model.provider),
+      workerCount: 3,
+      nodeIds: [],
+    };
+
+    setWorkspace((current) => ({
+      ...current,
+      model: {
+        ...current.model,
+        clusters: [...current.model.clusters, cluster],
+      },
+    }));
+    setSelectedClusterId(id);
+  }
+
+  function assignNodeToCluster(nodeId: string, clusterId: string) {
+    setWorkspace((current) => ({
+      ...current,
+      model: {
+        ...current.model,
+        clusters: current.model.clusters.map((cluster) => ({
+          ...cluster,
+          nodeIds:
+            cluster.id === clusterId
+              ? Array.from(new Set([...cluster.nodeIds, nodeId]))
+              : cluster.nodeIds.filter((candidateId) => candidateId !== nodeId),
+        })),
+      },
+    }));
+    setSelectedClusterId(clusterId);
   }
 
   function updateNode(patch: Partial<ArchitectureNode>) {
@@ -249,25 +477,70 @@ export function App() {
     });
   }
 
-  function updateNodePosition(nodeId: string, x: number, y: number) {
-    const clampedX = Math.min(Math.max(24, x), canvasBounds.width - canvasBounds.nodeWidth - 24);
-    const clampedY = Math.min(Math.max(24, y), canvasBounds.height - canvasBounds.nodeHeight - 24);
+  function clientPointToCanvas(svgElement: SVGSVGElement, clientX: number, clientY: number) {
+    const svgRect = svgElement.getBoundingClientRect();
+    const viewBoxX = (clientX - svgRect.left) * (virtualCanvas.width / svgRect.width);
+    const viewBoxY = (clientY - svgRect.top) * (virtualCanvas.height / svgRect.height);
 
-    setWorkspace((current) => ({
-      ...current,
-      layout: {
+    return {
+      x: (viewBoxX - canvasViewport.x) / canvasViewport.scale,
+      y: (viewBoxY - canvasViewport.y) / canvasViewport.scale,
+      viewBoxX,
+      viewBoxY,
+    };
+  }
+
+  function updateNodePosition(nodeId: string, x: number, y: number) {
+    const clampedX = clamp(x, 24, virtualCanvas.width - canvasBounds.nodeWidth - 24);
+    const clampedY = clamp(y, 24, virtualCanvas.height - canvasBounds.nodeHeight - 24);
+
+    setWorkspace((current) => {
+      const nextLayout = {
         ...current.layout,
         [nodeId]: { x: clampedX, y: clampedY },
-      },
-    }));
+      };
+      const center = {
+        x: clampedX + canvasBounds.nodeWidth / 2,
+        y: clampedY + canvasBounds.nodeHeight / 2,
+      };
+      const targetCluster = current.model.clusters.find((cluster) => {
+        const bounds = clusterBounds(cluster, nextLayout, nodeId);
+        return bounds ? pointInsideRect(center, bounds) : false;
+      });
+
+      return {
+        ...current,
+        layout: nextLayout,
+        model: targetCluster
+          ? {
+              ...current.model,
+              clusters: current.model.clusters.map((cluster) => ({
+                ...cluster,
+                nodeIds:
+                  cluster.id === targetCluster.id
+                    ? Array.from(new Set([...cluster.nodeIds, nodeId]))
+                    : cluster.nodeIds.filter((candidateId) => candidateId !== nodeId),
+              })),
+            }
+          : current.model,
+      };
+    });
   }
 
   function handlePointerMove(event: React.PointerEvent<SVGSVGElement>) {
-    const svgRect = event.currentTarget.getBoundingClientRect();
-    const scaleX = canvasBounds.width / svgRect.width;
-    const scaleY = canvasBounds.height / svgRect.height;
-    const svgX = (event.clientX - svgRect.left) * scaleX;
-    const svgY = (event.clientY - svgRect.top) * scaleY;
+    if (canvasPanRef.current) {
+      const svgRect = event.currentTarget.getBoundingClientRect();
+      const deltaX = (event.clientX - canvasPanRef.current.startX) * (virtualCanvas.width / svgRect.width);
+      const deltaY = (event.clientY - canvasPanRef.current.startY) * (virtualCanvas.height / svgRect.height);
+      setCanvasViewport((current) => ({
+        ...current,
+        x: canvasPanRef.current ? canvasPanRef.current.viewportX + deltaX : current.x,
+        y: canvasPanRef.current ? canvasPanRef.current.viewportY + deltaY : current.y,
+      }));
+      return;
+    }
+
+    const { x: svgX, y: svgY } = clientPointToCanvas(event.currentTarget, event.clientX, event.clientY);
 
     if (dragRef.current) {
       const x = svgX - dragRef.current.offsetX;
@@ -296,8 +569,8 @@ export function App() {
   }
 
   function handleSVGPointerUp() {
-      if (dragConnection) {
-        if (dragConnection.hoveredNodeId) {
+    if (dragConnection) {
+      if (dragConnection.hoveredNodeId) {
         const fromNode = resolvedModel.nodes.find((n) => n.id === dragConnection.fromId);
         const toNode = resolvedModel.nodes.find((n) => n.id === dragConnection.hoveredNodeId);
         if (fromNode && toNode) {
@@ -312,17 +585,32 @@ export function App() {
       }
       setDragConnection(null);
     }
+    canvasPanRef.current = null;
+    setCanvasPanning(false);
     dragRef.current = null;
   }
 
   function handleSVGPointerLeave() {
+    canvasPanRef.current = null;
+    setCanvasPanning(false);
     dragRef.current = null;
   }
 
-  function addNode(type: NodeType) {
+  function addNodeFromLibrary(item: NodeLibraryItem, positionOverride?: { x: number; y: number }) {
     const previousSelectedNodeId = selectedNode?.id ?? model.nodes[0]?.id ?? '';
-    const node = createNodeTemplate(type, model.defaultNamespace);
-    const position = nextLayoutPosition(model.nodes.length);
+    const template = createNodeTemplate(item.type, model.defaultNamespace);
+    const node = {
+      ...template,
+      ...item.overrides,
+      id: template.id,
+      namespace: item.overrides?.namespace ?? template.namespace,
+      serviceAccountName: item.overrides?.serviceAccountName ?? template.serviceAccountName,
+      environmentOverrides: {
+        ...template.environmentOverrides,
+        ...item.overrides?.environmentOverrides,
+      },
+    };
+    const position = positionOverride ?? nextLayoutPosition(model.nodes.length);
     const sourceNode = model.nodes.find((candidate) => candidate.id === previousSelectedNodeId);
     const suggestedType = sourceNode ? inferEdgeType(sourceNode, node) : 'http';
 
@@ -330,6 +618,11 @@ export function App() {
       model: {
         ...current.model,
         nodes: [...current.model.nodes, node],
+        clusters: current.model.clusters.map((cluster, index) =>
+          cluster.id === (selectedCluster?.id ?? current.model.clusters[0]?.id) || (!selectedCluster && index === 0)
+            ? { ...cluster, nodeIds: Array.from(new Set([...cluster.nodeIds, node.id])) }
+            : cluster,
+        ),
         edges: current.model.edges,
       },
       layout: {
@@ -347,8 +640,139 @@ export function App() {
     }));
     setConnectionMessage({
       tone: 'neutral',
-      text: `${node.name} added. Connect it from the stage or use the connection form.`,
+      text: `${node.name} added from ${item.name}. Connect it from the stage or use the connection form.`,
     });
+  }
+
+  function saveSelectedNodeAsCustomTile() {
+    if (!selectedNode) {
+      return;
+    }
+
+    const item: NodeLibraryItem = {
+      id: `custom-${librarySequenceRef.current++}`,
+      type: selectedNode.type,
+      name: selectedNode.name,
+      description: `${selectedNode.type} template`,
+      notes: `Saved from ${selectedNode.name}. Reuses image, tag, probes, resources, storage, ingress, and policy settings.`,
+      icon: selectedNode.type.slice(0, 2).toUpperCase(),
+      overrides: {
+        ...selectedNode,
+        id: undefined,
+        name: selectedNode.name,
+      } as Partial<ArchitectureNode>,
+    };
+
+    setCustomNodeLibrary((current) => [...current, item]);
+    setLibraryTab('custom');
+    setSelectedLibraryItemId(item.id);
+  }
+
+  function updateCustomLibraryItem(itemId: string, patch: Partial<NodeLibraryItem>) {
+    setCustomNodeLibrary((current) => current.map((item) => (item.id === itemId ? { ...item, ...patch } : item)));
+  }
+
+  function deleteCustomLibraryItem(itemId: string) {
+    setCustomNodeLibrary((current) => current.filter((item) => item.id !== itemId));
+    if (selectedLibraryItemId === itemId) {
+      setSelectedLibraryItemId(customNodeLibrary.find((item) => item.id !== itemId)?.id ?? coreNodeLibrary[0]?.id ?? '');
+    }
+  }
+
+  function templateWorkspaceForMerge(template: GraphTemplate): WorkspaceState {
+    const source = cloneWorkspace(template.workspace);
+    const suffix = `tpl-${templateSequenceRef.current++}`;
+    const nodeIdMap = new Map(source.model.nodes.map((node) => [node.id, `${node.id}-${suffix}`]));
+    const clusterIdMap = new Map(source.model.clusters.map((cluster) => [cluster.id, `${cluster.id}-${suffix}`]));
+    const existingPositions = Object.values(layout);
+    const offsetX = existingPositions.length > 0
+      ? Math.max(...existingPositions.map((position) => position.x + canvasBounds.nodeWidth)) + 180
+      : 120;
+    const offsetY = 80;
+
+    return {
+      model: {
+        ...source.model,
+        nodes: source.model.nodes.map((node) => ({
+          ...node,
+          id: nodeIdMap.get(node.id) ?? node.id,
+          name: `${node.name} copy`,
+          serviceAccountName: `${node.serviceAccountName}-${suffix}`,
+        })),
+        edges: source.model.edges.map((edge) => ({
+          ...edge,
+          id: `${edge.id}-${suffix}`,
+          from: nodeIdMap.get(edge.from) ?? edge.from,
+          to: nodeIdMap.get(edge.to) ?? edge.to,
+        })),
+        clusters: source.model.clusters.map((cluster) => ({
+          ...cluster,
+          id: clusterIdMap.get(cluster.id) ?? cluster.id,
+          name: `${cluster.name} copy`,
+          nodeIds: cluster.nodeIds.map((nodeId) => nodeIdMap.get(nodeId) ?? nodeId),
+        })),
+      },
+      layout: Object.fromEntries(
+        Object.entries(source.layout).map(([nodeId, position]) => [
+          nodeIdMap.get(nodeId) ?? nodeId,
+          {
+            x: position.x + offsetX,
+            y: position.y + offsetY,
+          },
+        ]),
+      ),
+    };
+  }
+
+  function loadGraphTemplate(template: GraphTemplate, mode: 'replace' | 'merge') {
+    if (mode === 'replace') {
+      const nextWorkspace = cloneWorkspace(template.workspace);
+      setWorkspace(nextWorkspace);
+      setSelectedNodeId(nextWorkspace.model.nodes[0]?.id ?? '');
+      setSelectedClusterId(nextWorkspace.model.clusters[0]?.id ?? '');
+      setCanvasViewport({ x: 0, y: 0, scale: 1 });
+      setTemplatesOpen(false);
+      return;
+    }
+
+    const incoming = templateWorkspaceForMerge(template);
+    setWorkspace((current) => ({
+      model: {
+        ...current.model,
+        nodes: [...current.model.nodes, ...incoming.model.nodes],
+        edges: [...current.model.edges, ...incoming.model.edges],
+        clusters: [...current.model.clusters, ...incoming.model.clusters],
+      },
+      layout: {
+        ...current.layout,
+        ...incoming.layout,
+      },
+    }));
+    setSelectedNodeId(incoming.model.nodes[0]?.id ?? selectedNodeId);
+    setSelectedClusterId(incoming.model.clusters[0]?.id ?? selectedClusterId);
+    setTemplatesOpen(false);
+  }
+
+  function saveCurrentGraphTemplate() {
+    const id = `template-custom-${templateSequenceRef.current++}`;
+    const template: GraphTemplate = {
+      id,
+      name: templateSaveName.trim() || workspace.model.name,
+      notes: templateSaveNotes.trim() || 'Saved from the current workspace.',
+      thumbnail: `${workspace.model.nodes.length} nodes / ${workspace.model.edges.length} edges / ${workspace.model.clusters.length} clusters`,
+      workspace: cloneWorkspace(workspace),
+      createdAt: `session-${templateSequenceRef.current}`,
+    };
+    setCustomGraphTemplates((current) => [...current, template]);
+    setTemplateTab('custom');
+    setSelectedTemplateId(id);
+  }
+
+  function deleteCustomGraphTemplate(templateId: string) {
+    setCustomGraphTemplates((current) => current.filter((template) => template.id !== templateId));
+    if (selectedTemplateId === templateId) {
+      setSelectedTemplateId(customGraphTemplates.find((template) => template.id !== templateId)?.id ?? builtinGraphTemplates[0]?.id ?? '');
+    }
   }
 
   function addEdge(fromId = edgeDraft.from, toId = edgeDraft.to, explicitType?: EdgeType) {
@@ -451,6 +875,10 @@ export function App() {
           ...current.model,
           nodes: nextNodes,
           edges: nextEdges,
+          clusters: current.model.clusters.map((cluster) => ({
+            ...cluster,
+            nodeIds: cluster.nodeIds.filter((nodeId) => nodeId !== selectedNode.id),
+          })),
         },
         layout: nextLayout,
       };
@@ -463,6 +891,7 @@ export function App() {
   function resetWorkspace() {
     setWorkspace(starterWorkspace);
     setSelectedNodeId(starterWorkspace.model.nodes[0]?.id ?? '');
+    setSelectedClusterId(starterWorkspace.model.clusters[0]?.id ?? '');
     setCanvasConnectMode(false);
     setEdgeDraft({
       from: starterWorkspace.model.nodes[0]?.id ?? '',
@@ -569,17 +998,106 @@ export function App() {
 
   const exportText = exportMode === 'yaml' ? yamlOutput : terraformOutput;
 
-  function startHandleConnection(nodeId: string, event: React.PointerEvent<SVGCircleElement>) {
-    const svgEl = event.currentTarget.ownerSVGElement;
-    const svgRect = svgEl?.getBoundingClientRect();
-    if (!svgRect || !svgEl) {
+  function handleCanvasWheel(event: React.WheelEvent<SVGSVGElement>) {
+    event.preventDefault();
+    const point = clientPointToCanvas(event.currentTarget, event.clientX, event.clientY);
+    const zoomDelta = event.deltaY > 0 ? 0.9 : 1.1;
+    const nextScale = clamp(canvasViewport.scale * zoomDelta, canvasBounds.minZoom, canvasBounds.maxZoom);
+
+    setCanvasViewport({
+      scale: nextScale,
+      x: point.viewBoxX - point.x * nextScale,
+      y: point.viewBoxY - point.y * nextScale,
+    });
+  }
+
+  function handleCanvasPointerDown(event: React.PointerEvent<SVGSVGElement>) {
+    const isCanvasBackground =
+      event.target === event.currentTarget ||
+      (event.target instanceof SVGElement && event.target.classList.contains('canvas-hit-area'));
+    const shouldPan = isCanvasBackground && (event.button === 0 || event.button === 1 || spacePressed);
+    if (!shouldPan) {
       return;
     }
 
-    const scaleX = canvasBounds.width / svgRect.width;
-    const scaleY = canvasBounds.height / svgRect.height;
-    const svgX = (event.clientX - svgRect.left) * scaleX;
-    const svgY = (event.clientY - svgRect.top) * scaleY;
+    canvasPanRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      viewportX: canvasViewport.x,
+      viewportY: canvasViewport.y,
+    };
+    setCanvasPanning(true);
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  }
+
+  function handleCanvasDrop(event: React.DragEvent<HTMLElement>) {
+    event.preventDefault();
+    const raw = event.dataTransfer.getData('application/visual-kubernetes-node');
+    if (!raw || !canvasSvgRef.current) {
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as { source: 'core' | 'custom'; id: string };
+      const sourceItems = parsed.source === 'custom' ? customNodeLibrary : coreNodeLibrary;
+      const item = sourceItems.find((candidate) => candidate.id === parsed.id);
+      if (!item) {
+        return;
+      }
+
+      const point = clientPointToCanvas(canvasSvgRef.current, event.clientX, event.clientY);
+      const position = Number.isFinite(point.x) && Number.isFinite(point.y)
+        ? {
+            x: clamp(point.x - canvasBounds.nodeWidth / 2, 24, virtualCanvas.width - canvasBounds.nodeWidth - 24),
+            y: clamp(point.y - 36, 24, virtualCanvas.height - canvasBounds.nodeHeight - 24),
+          }
+        : undefined;
+      addNodeFromLibrary(item, position);
+    } catch {
+      setConnectionMessage({ tone: 'error', text: 'Could not read the dragged node tile.' });
+    }
+  }
+
+  function resetCanvasView() {
+    setCanvasViewport({ x: 0, y: 0, scale: 1 });
+  }
+
+  function fitCanvasToContent() {
+    const positions = Object.values(layout);
+    if (positions.length === 0) {
+      resetCanvasView();
+      return;
+    }
+
+    const minX = Math.min(...positions.map((position) => position.x));
+    const minY = Math.min(...positions.map((position) => position.y));
+    const maxX = Math.max(...positions.map((position) => position.x + canvasBounds.nodeWidth));
+    const maxY = Math.max(...positions.map((position) => position.y + canvasBounds.nodeHeight));
+    const contentWidth = Math.max(maxX - minX, canvasBounds.nodeWidth);
+    const contentHeight = Math.max(maxY - minY, canvasBounds.nodeHeight);
+    const margin = 96;
+    const fitScale = clamp(
+      Math.min((virtualCanvas.width - margin * 2) / contentWidth, (virtualCanvas.height - margin * 2) / contentHeight),
+      canvasBounds.minZoom,
+      1.4,
+    );
+
+    setCanvasViewport({
+      scale: fitScale,
+      x: margin - minX * fitScale,
+      y: margin - minY * fitScale,
+    });
+  }
+
+  function startHandleConnection(nodeId: string, event: React.PointerEvent<SVGCircleElement>) {
+    const svgEl = event.currentTarget.ownerSVGElement;
+    if (!svgEl) {
+      return;
+    }
+
+    const { x: svgX, y: svgY } = clientPointToCanvas(svgEl, event.clientX, event.clientY);
 
     setSelectedNodeId(nodeId);
     setCanvasConnectMode(false);
@@ -604,8 +1122,8 @@ export function App() {
           </div>
           <nav className="editor-menu-items" aria-label="Editor menu">
             {editorMenus.map((item) => (
-              <button key={item} type="button" className="menu-button">
-                {item}
+              <button key={item.label} type="button" className="menu-button" title={item.commands}>
+                {item.label}
               </button>
             ))}
           </nav>
@@ -617,8 +1135,16 @@ export function App() {
         <div className="editor-actionbar">
           <div className="editor-action-group">
             {actionBarItems.map((item) => (
-              <button key={item} type="button" className="chrome-button">
-                {item}
+              <button
+                key={item.label}
+                type="button"
+                className="chrome-button command-button"
+                title={item.intent}
+                aria-label={item.label}
+                onClick={item.label === 'Browse' ? () => setTemplatesOpen(true) : undefined}
+              >
+                <span className="command-icon" aria-hidden="true">{item.icon}</span>
+                <span>{item.label}</span>
               </button>
             ))}
           </div>
@@ -636,14 +1162,17 @@ export function App() {
             ))}
           </div>
           <div className="editor-action-group">
-            <button type="button" className="chrome-button active">
-              Cluster Defaults
+            <button type="button" className="chrome-button command-button active" title="Edit per-cluster defaults once clusters exist" aria-label="Cluster Defaults">
+              <span className="command-icon" aria-hidden="true">CL</span>
+              <span>Cluster Defaults</span>
             </button>
-            <button type="button" className="chrome-button">
-              Simulate
+            <button type="button" className="chrome-button command-button" title="Animate traffic and failure behavior across graph edges" aria-label="Simulate">
+              <span className="command-icon" aria-hidden="true">SIM</span>
+              <span>Simulate</span>
             </button>
-            <button type="button" className="chrome-button">
-              Play
+            <button type="button" className="chrome-button command-button" title="Open read-only live preview output with diff markers" aria-label="Play">
+              <span className="command-icon" aria-hidden="true">RUN</span>
+              <span>Play</span>
             </button>
           </div>
         </div>
@@ -712,30 +1241,104 @@ export function App() {
               </div>
             </div>
 
-            <div className="section-card">
-              <div className="section-title">Add node</div>
-              <div className="field-grid">
-                <label>
-                  Node type
-                  <select value={newNodeType} onChange={(event) => setNewNodeType(event.target.value as NodeType)}>
-                    {availableNodeTypes.map((nodeType) => (
-                      <option key={nodeType.type} value={nodeType.type}>
-                        {nodeType.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <div className="node-type-description span-two">
-                  {availableNodeTypes.find((nodeType) => nodeType.type === newNodeType)?.description}
-                </div>
-                <div className="behavior-card span-two">
-                  <strong>Behavior</strong>
-                  <span>{nodeBehaviorCopy[newNodeType]}</span>
-                </div>
+            <div className="section-card node-library-card">
+              <div className="section-title">Node library</div>
+              <div className="library-tabs" aria-label="Node library tabs">
+                <button type="button" className={libraryTab === 'core' ? 'mini-tab active' : 'mini-tab'} onClick={() => setLibraryTab('core')}>
+                  Core
+                </button>
+                <button type="button" className={libraryTab === 'custom' ? 'mini-tab active' : 'mini-tab'} onClick={() => setLibraryTab('custom')}>
+                  Custom
+                </button>
               </div>
-              <button type="button" className="primary-button wide" onClick={() => addNode(newNodeType)}>
-                Add node
+              <div className="node-library-grid" aria-label="Node library">
+                {activeLibraryItems.length > 0 ? (
+                  activeLibraryItems.map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      className={item.id === selectedLibraryItem?.id ? 'node-library-tile active' : 'node-library-tile'}
+                      draggable
+                      onClick={() => setSelectedLibraryItemId(item.id)}
+                      onDoubleClick={() => addNodeFromLibrary(item)}
+                      onDragStart={(event) => {
+                        event.dataTransfer.setData('application/visual-kubernetes-node', JSON.stringify({ source: libraryTab, id: item.id }));
+                        event.dataTransfer.effectAllowed = 'copy';
+                      }}
+                      onContextMenu={(event) => {
+                        if (libraryTab === 'custom') {
+                          event.preventDefault();
+                          deleteCustomLibraryItem(item.id);
+                        }
+                      }}
+                      title={item.notes}
+                      aria-label={`Add ${item.name}`}
+                    >
+                      <span className="tile-icon">{item.icon}</span>
+                      <span className="tile-main">
+                        <strong>{item.name}</strong>
+                        <small>{item.description}</small>
+                      </span>
+                    </button>
+                  ))
+                ) : (
+                  <div className="node-type-description">
+                    No custom tiles yet. Select a node on the canvas and save it as a custom tile.
+                  </div>
+                )}
+              </div>
+              {selectedLibraryItem && (
+                <div className="behavior-card">
+                  <strong>{selectedLibraryItem.name}</strong>
+                  <span>{selectedLibraryItem.notes}</span>
+                </div>
+              )}
+              {libraryTab === 'custom' && selectedLibraryItem && (
+                <textarea
+                  className="code-input compact-input"
+                  aria-label="Custom tile notes"
+                  value={selectedLibraryItem.notes}
+                  onChange={(event) => updateCustomLibraryItem(selectedLibraryItem.id, { notes: event.target.value })}
+                />
+              )}
+              <button type="button" className="primary-button wide" onClick={() => selectedLibraryItem && addNodeFromLibrary(selectedLibraryItem)}>
+                Add selected tile
               </button>
+              <button type="button" className="ghost-button wide" onClick={saveSelectedNodeAsCustomTile}>
+                Save selected as custom
+              </button>
+              <button type="button" className="ghost-button wide" onClick={() => setTemplatesOpen(true)}>
+                Open templates
+              </button>
+              <div className="node-type-description">Drag a tile onto the graph, double-click it, or use Add selected tile.</div>
+            </div>
+
+            <div className="section-card">
+              <div className="section-title">Clusters</div>
+              <div className="cluster-list" aria-label="Clusters">
+                {clusterSummaries.map(({ cluster, nodes }) => (
+                  <button
+                    key={cluster.id}
+                    type="button"
+                    className={cluster.id === selectedCluster?.id ? 'cluster-list-item active' : 'cluster-list-item'}
+                    onClick={() => setSelectedClusterId(cluster.id)}
+                  >
+                    <span>{cluster.name}</span>
+                    <strong>{nodes.length} nodes</strong>
+                    <small>
+                      {cluster.provider} / {cluster.region} / {cluster.workerCount} workers
+                    </small>
+                  </button>
+                ))}
+              </div>
+              <button type="button" className="ghost-button wide" onClick={addCluster}>
+                Add cluster
+              </button>
+              {selectedNode && selectedCluster && (
+                <button type="button" className="ghost-button wide" onClick={() => assignNodeToCluster(selectedNode.id, selectedCluster.id)}>
+                  Assign selected node
+                </button>
+              )}
             </div>
 
             <div className="section-card">
@@ -892,6 +1495,13 @@ export function App() {
             <span className="toolbar-metric">
               {deploymentPlan.estimatedMonthlyCost.toLocaleString('en-US', { style: 'currency', currency: 'USD' })}/month
             </span>
+            <span className="toolbar-chip">{Math.round(canvasViewport.scale * 100)}%</span>
+            <button type="button" className="icon-button" onClick={fitCanvasToContent}>
+              Fit
+            </button>
+            <button type="button" className="icon-button" onClick={resetCanvasView}>
+              100%
+            </button>
             <button type="button" className="icon-button" onClick={() => setCanvasConnectMode((value) => !value)}>
               {canvasConnectMode ? 'Cancel connect' : 'Connect on stage'}
             </button>
@@ -904,13 +1514,23 @@ export function App() {
           </div>
         </div>
 
-        <section className="canvas-stage">
+        <section
+          className="canvas-stage"
+          onDragOver={(event) => {
+            event.preventDefault();
+            event.dataTransfer.dropEffect = 'copy';
+          }}
+          onDrop={handleCanvasDrop}
+        >
           <div className="canvas-watermark">CLUSTER GRAPH</div>
           <svg
-            viewBox={`0 0 ${canvasBounds.width} ${canvasBounds.height}`}
+            ref={canvasSvgRef}
+            viewBox={`0 0 ${virtualCanvas.width} ${virtualCanvas.height}`}
             role="img"
             aria-label="Architecture diagram"
-            className="diagram"
+            className={canvasPanning || spacePressed ? 'diagram panning' : 'diagram'}
+            onWheel={handleCanvasWheel}
+            onPointerDown={handleCanvasPointerDown}
             onPointerMove={handlePointerMove}
             onPointerUp={handleSVGPointerUp}
             onPointerLeave={handleSVGPointerLeave}
@@ -922,6 +1542,22 @@ export function App() {
               </linearGradient>
             </defs>
 
+            <rect className="canvas-hit-area" x="0" y="0" width={virtualCanvas.width} height={virtualCanvas.height} />
+            <g className="graph-layer" transform={`translate(${canvasViewport.x} ${canvasViewport.y}) scale(${canvasViewport.scale})`}>
+            {clusterSummaries.map(({ cluster, bounds, nodes }) => {
+              if (!bounds) {
+                return null;
+              }
+              const active = selectedCluster?.id === cluster.id;
+              return (
+                <g key={cluster.id} className={active ? 'cluster-backdrop active' : 'cluster-backdrop'}>
+                  <rect x={bounds.x} y={bounds.y} width={bounds.width} height={bounds.height} rx="22" ry="22" />
+                  <text x={bounds.x + 18} y={bounds.y + 28} className="cluster-label">
+                    {cluster.name} | {cluster.region} | {nodes.length} nodes
+                  </text>
+                </g>
+              );
+            })}
             {resolvedModel.edges.map((edge) => {
               const from = layout[edge.from];
               const to = layout[edge.to];
@@ -934,6 +1570,9 @@ export function App() {
               const x2 = to.x + nodePortInset;
               const y2 = to.y + nodePortOffsetY;
               const dx = Math.max(Math.abs(x2 - x1) * 0.5, 80);
+              const fromCluster = model.clusters.find((cluster) => cluster.nodeIds.includes(edge.from));
+              const toCluster = model.clusters.find((cluster) => cluster.nodeIds.includes(edge.to));
+              const crossCluster = Boolean(fromCluster && toCluster && fromCluster.id !== toCluster.id);
 
               return (
                 <g key={edge.id}>
@@ -942,10 +1581,10 @@ export function App() {
                     stroke={edge.networkPolicy === 'deny' ? '#ff6b6b' : 'url(#edgeGlow)'}
                     strokeWidth="3"
                     fill="none"
-                    strokeDasharray={edge.networkPolicy === 'deny' ? '2 8' : edge.type === 'async' ? '12 6' : edge.type === 'data' ? '4 4' : undefined}
+                    strokeDasharray={crossCluster ? '16 8' : edge.networkPolicy === 'deny' ? '2 8' : edge.type === 'async' ? '12 6' : edge.type === 'data' ? '4 4' : undefined}
                   />
                   <text x={(x1 + x2) / 2} y={Math.min(y1, y2) - 10} textAnchor="middle" className="edge-label">
-                    {edge.type} | {edge.latencyBudgetMs}ms | {edge.networkPolicy}
+                    {edge.type} | {edge.latencyBudgetMs}ms | {edge.networkPolicy}{crossCluster ? ' | cross-cluster' : ''}
                   </text>
                 </g>
               );
@@ -1032,8 +1671,12 @@ export function App() {
                   ? 'storage'
                   : node.type === 'queue'
                     ? 'events'
-                    : node.type === 'job' || node.type === 'cronjob'
-                      ? 'trigger'
+                  : node.type === 'job' || node.type === 'cronjob'
+                    ? 'trigger'
+                    : node.type === 'networkPolicy'
+                      ? 'select'
+                      : node.type === 'role'
+                        ? 'bind'
                       : 'in';
               const pinSourceLabel =
                 node.type === 'ingress'
@@ -1042,6 +1685,10 @@ export function App() {
                     ? 'rows'
                     : node.type === 'job' || node.type === 'cronjob' || node.type === 'worker'
                       ? 'deps'
+                      : node.type === 'networkPolicy'
+                        ? 'policy'
+                        : node.type === 'role'
+                          ? 'rbac'
                       : 'out';
 
               return (
@@ -1054,16 +1701,16 @@ export function App() {
                     }
 
                     const svgRect = event.currentTarget.ownerSVGElement?.getBoundingClientRect();
-                    if (!svgRect) {
+                    const svgElement = event.currentTarget.ownerSVGElement;
+                    if (!svgRect || !svgElement) {
                       return;
                     }
 
-                    const scaleX = canvasBounds.width / svgRect.width;
-                    const scaleY = canvasBounds.height / svgRect.height;
+                    const pointer = clientPointToCanvas(svgElement, event.clientX, event.clientY);
                     dragRef.current = {
                       nodeId: node.id,
-                      offsetX: (event.clientX - svgRect.left) * scaleX - position.x,
-                      offsetY: (event.clientY - svgRect.top) * scaleY - position.y,
+                      offsetX: pointer.x - position.x,
+                      offsetY: pointer.y - position.y,
                     };
                     event.currentTarget.setPointerCapture(event.pointerId);
                   }}
@@ -1130,6 +1777,7 @@ export function App() {
                 </g>
               );
             })}
+            </g>
           </svg>
         </section>
 
@@ -1210,6 +1858,156 @@ export function App() {
                 </button>
               </div>
             </div>
+
+            {selectedCluster && (
+              <div className="section-card">
+                <div className="section-title">Cluster</div>
+                <div className="field-grid">
+                  <label>
+                    Cluster
+                    <select value={selectedCluster.id} onChange={(event) => setSelectedClusterId(event.target.value)}>
+                      {model.clusters.map((cluster) => (
+                        <option key={cluster.id} value={cluster.id}>
+                          {cluster.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Name
+                    <input value={selectedCluster.name} onChange={(event) => updateCluster(selectedCluster.id, { name: event.target.value })} />
+                  </label>
+                  <label>
+                    Cloud
+                    <select
+                      value={selectedCluster.provider}
+                      onChange={(event) => updateCluster(selectedCluster.id, { provider: event.target.value as CloudProvider })}
+                    >
+                      <option value="aws">AWS</option>
+                      <option value="gcp">GCP</option>
+                      <option value="azure">Azure</option>
+                      <option value="generic">Generic</option>
+                    </select>
+                  </label>
+                  <label>
+                    Region
+                    <input value={selectedCluster.region} onChange={(event) => updateCluster(selectedCluster.id, { region: event.target.value })} />
+                  </label>
+                  <label>
+                    Worker count
+                    <input
+                      type="number"
+                      min="1"
+                      value={selectedCluster.workerCount}
+                      onChange={(event) => updateCluster(selectedCluster.id, { workerCount: Number(event.target.value) })}
+                    />
+                  </label>
+                  <label>
+                    Node assignment
+                    <select
+                      value={model.clusters.find((cluster) => cluster.nodeIds.includes(selectedNode.id))?.id ?? ''}
+                      onChange={(event) => assignNodeToCluster(selectedNode.id, event.target.value)}
+                    >
+                      <option value="">Unassigned</option>
+                      {model.clusters.map((cluster) => (
+                        <option key={cluster.id} value={cluster.id}>
+                          {cluster.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="node-type-description span-two">
+                    Drag a node into a cluster backdrop to reassign it. Cross-cluster edges render dashed and export with review annotations.
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {selectedNode.type === 'networkPolicy' && (
+              <div className="section-card">
+                <div className="section-title">NetworkPolicy</div>
+                <div className="field-grid">
+                  <label className="span-two">
+                    Target selector labels
+                    <textarea
+                      className="code-input compact-input"
+                      value={formatKeyValueEntries(selectedNode.networkPolicy.targetLabels)}
+                      onChange={(event) =>
+                        updateNode({
+                          networkPolicy: { ...selectedNode.networkPolicy, targetLabels: parseKeyValueEntries(event.target.value) },
+                        })
+                      }
+                    />
+                  </label>
+                  <label className="span-two">
+                    Ingress from labels
+                    <textarea
+                      className="code-input compact-input"
+                      value={formatKeyValueEntries(selectedNode.networkPolicy.ingressFromLabels)}
+                      onChange={(event) =>
+                        updateNode({
+                          networkPolicy: { ...selectedNode.networkPolicy, ingressFromLabels: parseKeyValueEntries(event.target.value) },
+                        })
+                      }
+                    />
+                  </label>
+                  <label className="span-two">
+                    Egress CIDRs
+                    <textarea
+                      className="code-input compact-input"
+                      value={selectedNode.networkPolicy.egressToCidrs.join('\n')}
+                      onChange={(event) =>
+                        updateNode({
+                          networkPolicy: { ...selectedNode.networkPolicy, egressToCidrs: parseListInput(event.target.value) },
+                        })
+                      }
+                    />
+                  </label>
+                  <label className="toggle-row">
+                    <span>Allow ingress</span>
+                    <input
+                      type="checkbox"
+                      checked={selectedNode.networkPolicy.allowIngress}
+                      onChange={(event) => updateNode({ networkPolicy: { ...selectedNode.networkPolicy, allowIngress: event.target.checked } })}
+                    />
+                  </label>
+                  <label className="toggle-row">
+                    <span>Allow egress</span>
+                    <input
+                      type="checkbox"
+                      checked={selectedNode.networkPolicy.allowEgress}
+                      onChange={(event) => updateNode({ networkPolicy: { ...selectedNode.networkPolicy, allowEgress: event.target.checked } })}
+                    />
+                  </label>
+                  <div className="node-type-description span-two">Use `key=value` labels. Explicit NetworkPolicy nodes replace edge-inferred allow policies.</div>
+                </div>
+              </div>
+            )}
+
+            {selectedNode.type === 'role' && (
+              <div className="section-card">
+                <div className="section-title">Role</div>
+                <div className="field-grid">
+                  <label className="span-two">
+                    Service accounts
+                    <textarea
+                      className="code-input compact-input"
+                      value={selectedNode.role.serviceAccounts.join('\n')}
+                      onChange={(event) => updateNode({ role: { ...selectedNode.role, serviceAccounts: parseListInput(event.target.value) } })}
+                    />
+                  </label>
+                  <label className="span-two">
+                    Rules
+                    <textarea
+                      className="code-input"
+                      value={formatRoleRules(selectedNode.role.rules)}
+                      onChange={(event) => updateNode({ role: { ...selectedNode.role, rules: parseRoleRules(event.target.value) } })}
+                    />
+                  </label>
+                  <div className="node-type-description span-two">Rule format: `apiGroup1,apiGroup2|resource1,resource2|verb1,verb2`.</div>
+                </div>
+              </div>
+            )}
 
             <div className="section-card">
               <div className="section-title">Runtime</div>
@@ -1995,6 +2793,92 @@ export function App() {
         )}
       </aside>
       </div>
+      {templatesOpen && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Template browser">
+          <div className="template-modal">
+            <div className="modal-header">
+              <div>
+                <div className="section-title">Templates</div>
+                <h2>Graph browser</h2>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setTemplatesOpen(false)}>
+                Close
+              </button>
+            </div>
+            <div className="library-tabs" aria-label="Template tabs">
+              <button type="button" className={templateTab === 'builtin' ? 'mini-tab active' : 'mini-tab'} onClick={() => setTemplateTab('builtin')}>
+                Out-of-box
+              </button>
+              <button type="button" className={templateTab === 'custom' ? 'mini-tab active' : 'mini-tab'} onClick={() => setTemplateTab('custom')}>
+                Custom
+              </button>
+            </div>
+            <div className="template-browser">
+              <div className="template-grid" aria-label="Graph templates">
+                {activeGraphTemplates.length > 0 ? (
+                  activeGraphTemplates.map((template) => (
+                    <button
+                      key={template.id}
+                      type="button"
+                      className={template.id === selectedGraphTemplate?.id ? 'template-card active' : 'template-card'}
+                      onClick={() => setSelectedTemplateId(template.id)}
+                      onDoubleClick={() => loadGraphTemplate(template, 'replace')}
+                    >
+                      <span className="template-thumb">{template.thumbnail}</span>
+                      <strong>{template.name}</strong>
+                      <small>{template.workspace.model.nodes.length} nodes / {template.workspace.model.clusters.length} clusters</small>
+                    </button>
+                  ))
+                ) : (
+                  <div className="empty-template-state">No custom templates yet. Save the current graph to create one.</div>
+                )}
+              </div>
+              <div className="template-detail">
+                {selectedGraphTemplate && (
+                  <>
+                    <div className="section-title">Selected template</div>
+                    <h3>{selectedGraphTemplate.name}</h3>
+                    <p>{selectedGraphTemplate.notes}</p>
+                    <div className="template-stats">
+                      <span>{selectedGraphTemplate.workspace.model.nodes.length} nodes</span>
+                      <span>{selectedGraphTemplate.workspace.model.edges.length} edges</span>
+                      <span>{selectedGraphTemplate.workspace.model.clusters.length} clusters</span>
+                      <span>{selectedGraphTemplate.workspace.model.provider}</span>
+                    </div>
+                    <div className="template-actions">
+                      <button type="button" className="primary-button" onClick={() => loadGraphTemplate(selectedGraphTemplate, 'replace')}>
+                        Replace graph
+                      </button>
+                      <button type="button" className="ghost-button" onClick={() => loadGraphTemplate(selectedGraphTemplate, 'merge')}>
+                        Merge with offset
+                      </button>
+                      {templateTab === 'custom' && (
+                        <button type="button" className="danger-button" onClick={() => deleteCustomGraphTemplate(selectedGraphTemplate.id)}>
+                          Delete template
+                        </button>
+                      )}
+                    </div>
+                  </>
+                )}
+                <div className="save-template-panel">
+                  <div className="section-title">Save current graph</div>
+                  <label>
+                    Template name
+                    <input value={templateSaveName} onChange={(event) => setTemplateSaveName(event.target.value)} />
+                  </label>
+                  <label>
+                    Notes
+                    <textarea className="code-input compact-input" value={templateSaveNotes} onChange={(event) => setTemplateSaveNotes(event.target.value)} />
+                  </label>
+                  <button type="button" className="primary-button wide" onClick={saveCurrentGraphTemplate}>
+                    Save current as template
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

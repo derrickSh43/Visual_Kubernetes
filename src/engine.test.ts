@@ -300,6 +300,88 @@ describe('architecture engine', () => {
     expect(yaml).toContain('terminationGracePeriodSeconds: 20');
   });
 
+  it('exports explicit NetworkPolicy and Role nodes instead of only inferred policies', () => {
+    const policy = {
+      ...createNodeTemplate('networkPolicy', 'checkout-platform'),
+      id: 'network-policy-checkout',
+      name: 'Checkout ingress policy',
+      networkPolicy: {
+        targetLabels: [{ key: 'app', value: 'checkout-service' }],
+        ingressFromLabels: [{ key: 'app', value: 'public-api' }],
+        egressToCidrs: ['10.0.0.0/8'],
+        allowIngress: true,
+        allowEgress: true,
+      },
+    };
+    const role = {
+      ...createNodeTemplate('role', 'checkout-platform'),
+      id: 'role-checkout',
+      name: 'Checkout runtime role',
+      role: {
+        serviceAccounts: ['service-checkout-sa'],
+        rules: [{ apiGroups: [''], resources: ['configmaps', 'secrets'], verbs: ['get'] }],
+      },
+    };
+    const model = {
+      ...starterArchitecture,
+      nodes: [...starterArchitecture.nodes, policy, role],
+      clusters: starterArchitecture.clusters.map((cluster) => ({
+        ...cluster,
+        nodeIds: [...cluster.nodeIds, policy.id, role.id],
+      })),
+    };
+    const yaml = generateKubernetesYaml(model);
+    const roleDocuments = generateKubernetesDocuments(model).filter((document) => document.kind === 'Role');
+
+    expect(yaml).toContain('name: checkout-ingress-policy');
+    expect(yaml).toContain('cidr: 10.0.0.0/8');
+    expect(yaml).toContain('name: checkout-runtime-role');
+    expect(yaml).toContain('name: service-checkout-sa');
+    expect(roleDocuments.some((document) => document.name === 'checkout-platform-checkout-service-runtime')).toBe(false);
+    expect(validateArchitecture(model).some((issue) => issue.message.includes('Checkout ingress policy'))).toBe(false);
+  });
+
+  it('exports cluster overlays and cross-cluster edge annotations', () => {
+    const checkout = starterArchitecture.nodes.find((node) => node.id === 'service-checkout')!;
+    const inventory = starterArchitecture.nodes.find((node) => node.id === 'service-inventory')!;
+    const model = {
+      ...starterArchitecture,
+      clusters: [
+        {
+          id: 'cluster-east',
+          name: 'East EKS',
+          provider: 'aws' as const,
+          region: 'us-east-1',
+          workerCount: 3,
+          nodeIds: [checkout.id],
+        },
+        {
+          id: 'cluster-west',
+          name: 'West EKS',
+          provider: 'aws' as const,
+          region: 'us-west-2',
+          workerCount: 2,
+          nodeIds: [inventory.id],
+        },
+      ],
+      nodes: [checkout, inventory],
+      edges: [{ id: 'cross', from: checkout.id, to: inventory.id, type: 'http' as const, latencyBudgetMs: 120, networkPolicy: 'allow' as const }],
+    };
+
+    const yaml = generateKubernetesYaml(model);
+    const files = generateProjectFiles(model);
+    const messages = validateArchitecture(model).map((issue) => issue.message);
+
+    expect(yaml).toContain('visual-kubernetes.io/cross-cluster-edge: "true"');
+    expect(files.map((file) => file.path)).toEqual(expect.arrayContaining([
+      'k8s/prod/clusters/east-eks/kustomization.yaml',
+      'k8s/prod/clusters/east-eks/kubeconfig-context.env',
+      'k8s/prod/clusters/west-eks/kustomization.yaml',
+    ]));
+    expect(files.find((file) => file.path === 'k8s/prod/clusters/west-eks/kubeconfig-context.env')?.content).toContain('REGION=us-west-2');
+    expect(messages).toEqual(expect.arrayContaining([expect.stringContaining('crosses clusters')]));
+  });
+
   it('surfaces hardened validation for incomplete and risky runtime models', () => {
     const riskyService = createNodeTemplate('service');
     const riskyDatabase = createNodeTemplate('database');
