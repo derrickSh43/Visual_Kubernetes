@@ -17,6 +17,24 @@ Known prototype constraints:
 
 If you are reviewing this repo, please evaluate the workflow and direction as an early local tool. Security feedback is welcome, but this is not being presented as a finished or production-ready system.
 
+## Why Visual Kubernetes?
+
+Kubernetes gives teams a powerful way to run real infrastructure, but the authoring experience usually starts in YAML. That makes it easy to lose the bigger picture: what talks to what, what runs where, what should be isolated, and what infrastructure will actually be created.
+
+Visual Kubernetes starts from the architecture instead. Users model workloads, data stores, ingress, queues, security boundaries, and relationships on a canvas. From that model, the tool generates Kubernetes YAML and Terraform-oriented project output.
+
+The goal is not to replace platform engineers or hide Kubernetes. The goal is to make infrastructure easier to design, review, teach, and bootstrap before teams commit to production-ready code.
+
+## Who is this for?
+
+Visual Kubernetes is intended for:
+
+- Application developers who need a clearer path from app architecture to Kubernetes manifests.
+- Platform and DevOps engineers who want to prototype infrastructure patterns visually.
+- Teams reviewing service topology, namespaces, network policies, autoscaling, probes, and resource limits before implementation.
+- Engineers learning Kubernetes who want to see how architecture decisions map to YAML.
+- Early-stage teams that need a fast starting point for infrastructure-as-code instead of a blank folder.
+
 ## What is implemented
 
 - Interactive React + TypeScript frontend built with Vite
