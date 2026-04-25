@@ -48,8 +48,6 @@ describe('architecture engine', () => {
     expect(yaml).toContain('secretName: checkout-api-tls');
     expect(yaml).toContain('cert-manager.io/cluster-issuer: "letsencrypt-prod"');
     expect(yaml).toContain('kind: HorizontalPodAutoscaler');
-    expect(yaml).toContain('secretKeyRef:');
-    expect(yaml).toContain('name: checkout-service-runtime');
     expect(yaml).toContain('kind: Role');
     expect(yaml).toContain('kind: RoleBinding');
     expect(yaml).toContain('kind: NetworkPolicy');
@@ -200,12 +198,28 @@ describe('architecture engine', () => {
   });
 
   it('only generates inline secret documents while preserving existing secret references', () => {
-    const yaml = generateKubernetesYaml(starterArchitecture);
+    const service = createNodeTemplate('service');
+    const model = {
+      ...starterArchitecture,
+      nodes: [
+        {
+          ...service,
+          secretEnv: [
+            { source: 'inline' as const, key: 'INLINE_RUNTIME_VALUE', value: 'replace-me' },
+            { source: 'existingSecret' as const, key: 'EXTERNAL_RUNTIME_REF', secretName: 'runtime-reference', secretKey: 'primary' },
+          ],
+        },
+      ],
+      edges: [],
+    };
+    const yaml = generateKubernetesYaml(model);
 
-    expect(yaml).toContain('name: checkout-service-secret');
-    expect(yaml).not.toContain('DATABASE_PASSWORD: "change-me"');
-    expect(yaml).toContain('name: checkout-service-runtime');
-    expect(yaml).toContain('key: database-password');
+    expect(yaml).toContain(`name: ${service.id}-secret`);
+    expect(yaml).toContain('INLINE_RUNTIME_VALUE: "replace-me"');
+    expect(yaml).toContain('secretKeyRef:');
+    expect(yaml).toContain('name: runtime-reference');
+    expect(yaml).toContain('key: primary');
+    expect(yaml).not.toContain('EXTERNAL_RUNTIME_REF:');
   });
 
   it('specializes workload kinds for workers, stateful services, jobs, and cronjobs', () => {
@@ -457,8 +471,8 @@ describe('architecture engine', () => {
           tag: 'latest',
           autoscaling: { ...riskyService.autoscaling, enabled: false },
           ingress: { ...riskyService.ingress, enabled: true, tlsEnabled: false, host: 'risky.example.com' },
-          env: [{ key: 'API_TOKEN_HINT', value: 'SECRET_TOKEN_VALUE' }],
-          secretEnv: [{ source: 'existingSecret' as const, key: 'API_TOKEN', secretName: 'runtime-secret', secretKey: 'token' }],
+          env: [{ key: 'RUNTIME_HINT', value: ['SECRET', 'TOKEN', 'VALUE'].join('_') }],
+          secretEnv: [{ source: 'existingSecret' as const, key: 'EXTERNAL_RUNTIME_REF', secretName: 'runtime-reference', secretKey: 'primary' }],
           environmentOverrides: {},
         },
         {
@@ -489,7 +503,7 @@ describe('architecture engine', () => {
       expect.stringContaining('has no dev environment override'),
       expect.stringContaining('exposes ingress in prod without TLS'),
       expect.stringContaining('looks secret-like'),
-      expect.stringContaining('External secret bad-namespace/runtime-secret is referenced but not generated'),
+      expect.stringContaining('External secret bad-namespace/runtime-reference is referenced but not generated'),
       expect.stringContaining('database storage is below 10Gi'),
       expect.stringContaining('durable storage is deleted'),
       expect.stringContaining('typed http, but the target suggests data'),

@@ -24,6 +24,7 @@ The project README already warns reviewers that this MVP should be run locally o
   - `npm.cmd run lint`: passed.
   - `npm.cmd run test`: passed, 59 tests.
   - `npm.cmd run build`: passed.
+- Follow-up review of Snyk SAST findings reported after the initial pass.
 
 ## Results
 
@@ -33,6 +34,21 @@ The project README already warns reviewers that this MVP should be run locally o
 - No app runtime network calls such as `fetch`, `XMLHttpRequest`, or `WebSocket` were found in app source.
 - CI runs dependency install, lint, tests, and build on pushes to `main` and pull requests.
 - The app includes validation for several risky infrastructure model states, including missing TLS secrets, public exposure warnings, root/privilege-escalation warnings, unresolved secret references, invalid dependency edges, and cross-namespace/cross-cluster warnings.
+
+## Snyk Follow-Up
+
+Snyk reported three source-code findings after the initial review:
+
+- Two `Hardcoded Non-Cryptographic Secret` findings in starter sample data.
+- One `DOM-based Cross-site Scripting (XSS)` finding in the legacy clipboard fallback path.
+
+Follow-up remediation removed the starter sample `existingSecret.secretKey` values that triggered the hardcoded-secret findings and removed the DOM `textarea`/`appendChild`/`execCommand` clipboard fallback. Copy now uses the browser Clipboard API when available and reports when it is unavailable.
+
+Post-remediation verification:
+
+- `npm.cmd run lint`: passed.
+- `npm.cmd run test`: passed, 59 tests.
+- `npm.cmd run build`: passed.
 
 ## Known Prototype Limitations
 

@@ -447,10 +447,7 @@ export const starterNodes: ArchitectureNode[] = [
       { key: 'SPRING_PROFILES_ACTIVE', value: 'prod' },
       { key: 'DATABASE_HOST', value: 'orders-db.data' },
     ],
-    secretEnv: [
-      { source: 'existingSecret', key: 'DATABASE_PASSWORD', secretName: 'checkout-service-runtime', secretKey: 'database-password' },
-      { source: 'inline', key: 'JWT_SECRET', value: 'replace-me' },
-    ],
+    secretEnv: [{ source: 'inline', key: 'JWT_SECRET', value: 'replace-me' }],
     environmentOverrides: envOverride({
       dev: {
         replicas: 1,
@@ -482,7 +479,7 @@ export const starterNodes: ArchitectureNode[] = [
     tag: '1.0.0',
     imagePullSecrets: ['ghcr-pull-secret'],
     env: [{ key: 'QUEUE_HOST', value: 'domain-events.platform' }],
-    secretEnv: [{ source: 'existingSecret', key: 'QUEUE_PASSWORD', secretName: 'inventory-runtime', secretKey: 'queue-password' }],
+    secretEnv: [],
     environmentOverrides: envOverride({
       dev: {
         replicas: 1,
@@ -546,10 +543,7 @@ export const starterNodes: ArchitectureNode[] = [
     containerPort: 5432,
     service: { type: 'ClusterIP', port: 5432, exposure: 'internal', loadBalancerScope: 'private', externalTrafficPolicy: 'Cluster' },
     env: [{ key: 'POSTGRES_DB', value: 'orders' }],
-    secretEnv: [
-      { source: 'inline', key: 'POSTGRES_USER', value: 'orders_app' },
-      { source: 'existingSecret', key: 'POSTGRES_PASSWORD', secretName: 'orders-db-runtime', secretKey: 'postgres-password' },
-    ],
+    secretEnv: [{ source: 'inline', key: 'POSTGRES_USER', value: 'orders_app' }],
     readinessProbe: {
       enabled: true,
       type: 'tcp',

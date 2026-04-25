@@ -1373,20 +1373,14 @@ export function App() {
     if (!content) {
       return;
     }
-    if (navigator.clipboard) {
+
+    if (navigator.clipboard?.writeText) {
       await navigator.clipboard.writeText(content);
+      setActionStatus('Copied selected YAML to clipboard.');
       return;
     }
 
-    const textarea = document.createElement('textarea');
-    textarea.value = content;
-    textarea.setAttribute('readonly', 'true');
-    textarea.style.position = 'fixed';
-    textarea.style.opacity = '0';
-    document.body.appendChild(textarea);
-    textarea.select();
-    document.execCommand('copy');
-    document.body.removeChild(textarea);
+    setActionStatus('Clipboard API is unavailable in this browser context.');
   }
 
   const selectedNodeExportFilename = selectedNode ? `${selectedNode.name.toLowerCase().replace(/[^a-z0-9]+/g, '-') || selectedNode.id}.yaml` : 'selected-node.yaml';
