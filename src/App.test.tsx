@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { App } from './App';
 import { GRAPH_TEMPLATE_STORAGE_KEY, NODE_LIBRARY_STORAGE_KEY, SNAPSHOT_STORAGE_KEY, WORKSPACE_STORAGE_KEY } from './storage';
 
@@ -92,7 +92,7 @@ describe('App', () => {
   it('auto-expands long canvas nodes within the maximum size cap', () => {
     const { container } = render(<App />);
 
-    const checkoutNode = container.querySelector('g[aria-label="Checkout Service"]');
+    const checkoutNode = container.querySelector('g[aria-label="Select Checkout Service"]');
     const nodeBody = checkoutNode?.querySelector('rect');
     const width = Number(nodeBody?.getAttribute('width'));
     const height = Number(nodeBody?.getAttribute('height'));
@@ -139,7 +139,7 @@ describe('App', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Find' }));
     fireEvent.change(screen.getByLabelText(/Node search/i), { target: { value: 'orders' } });
-    fireEvent.click(screen.getByRole('button', { name: /Orders DB/i }));
+    fireEvent.click(within(screen.getByRole('dialog', { name: /Find nodes/i })).getByRole('button', { name: /Orders DB/i }));
     expect(screen.getByDisplayValue('Orders DB')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Blueprint Settings' }));
@@ -232,6 +232,26 @@ describe('App', () => {
     expect(graphLayer?.getAttribute('transform')).not.toBe('translate(0 0) scale(1)');
   });
 
+  it('supports keyboard shortcuts and keyboard node selection', async () => {
+    const { container } = render(<App />);
+
+    fireEvent.keyDown(window, { key: 'f', code: 'KeyF', ctrlKey: true });
+    expect(screen.getByRole('dialog', { name: /Find nodes/i })).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 'Escape', code: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /Find nodes/i })).not.toBeInTheDocument());
+
+    const inventoryNode = container.querySelector('g[aria-label="Select Inventory Service"]');
+    expect(inventoryNode).toHaveAttribute('role', 'button');
+    expect(inventoryNode).toHaveAttribute('tabindex', '0');
+
+    fireEvent.keyDown(inventoryNode!, { key: 'Enter', code: 'Enter' });
+    expect(screen.getByDisplayValue('Inventory Service')).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 's', code: 'KeyS', ctrlKey: true });
+    expect(await screen.findByText(/Saved Keyboard save/i)).toBeInTheDocument();
+  });
+
   it('shows graph-derived dependency wiring for the selected node', () => {
     render(<App />);
 
@@ -301,10 +321,12 @@ describe('App', () => {
     expect(screen.getByLabelText(/yaml export/i)).toHaveTextContent('schedule: "*/15 * * * *"');
   });
 
-  it('adds explicit NetworkPolicy and Role nodes from the palette', () => {
+  it('adds explicit NetworkPolicy and Role nodes from the palette', async () => {
     render(<App />);
 
-    addLibraryTile(/Add network policy/i);
+    fireEvent.doubleClick(screen.getByRole('button', { name: /Add network policy/i }));
+    await waitFor(() => expect(screen.getByLabelText(/Target selector labels/i)).toBeInTheDocument());
+
     fireEvent.change(screen.getByLabelText(/Target selector labels/i), { target: { value: 'app=checkout-service' } });
 
     expect(screen.getByLabelText(/yaml export/i)).toHaveTextContent('kind: NetworkPolicy');
@@ -386,6 +408,50 @@ describe('App', () => {
     const saved = window.localStorage.getItem(WORKSPACE_STORAGE_KEY) ?? '';
     expect(saved).toContain('Checkout Service copy');
     expect(saved).toContain('cluster-primary-tpl-');
+  });
+
+  it('covers the golden graph-builder workflow through ZIP export', async () => {
+    const createObjectUrl = vi.fn(() => 'blob:visual-kubernetes-golden');
+    const revokeObjectUrl = vi.fn();
+    const downloadedFiles: string[] = [];
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      downloadedFiles.push(this.download);
+    });
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectUrl });
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectUrl });
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Browse' }));
+    fireEvent.click(screen.getByRole('button', { name: /Microservices Starter/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Replace graph/i }));
+
+    expect(screen.getAllByText(/Checkout Service/i).length).toBeGreaterThan(0);
+
+    const diagram = screen.getByRole('img', { name: /architecture diagram/i });
+    fireEvent.wheel(diagram, { deltaY: 500, clientX: 800, clientY: 400 });
+    expect(screen.getByText('90%')).toBeInTheDocument();
+
+    fireEvent.doubleClick(screen.getByRole('button', { name: /Add network policy/i }));
+    await waitFor(() => expect(screen.getByLabelText(/Target selector labels/i)).toBeInTheDocument());
+
+    fireEvent.change(screen.getByLabelText(/Target selector labels/i), { target: { value: 'app=checkout-service' } });
+    fireEvent.change(screen.getByLabelText(/Ingress from labels/i), { target: { value: 'app=public-api' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByText(/Saved Manual save/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /Full stack YAML/i }));
+    expect(screen.getByLabelText(/^yaml export$/i)).toHaveTextContent('kind: NetworkPolicy');
+    expect(screen.getByLabelText(/^yaml export$/i)).toHaveTextContent('app: checkout-service');
+
+    fireEvent.click(screen.getByRole('button', { name: /Download ZIP/i }));
+
+    await waitFor(() => expect(downloadedFiles).toContain('checkout-platform-infra.zip'));
+    expect(createObjectUrl).toHaveBeenCalledWith(expect.any(Blob));
+    expect(revokeObjectUrl).toHaveBeenCalledWith('blob:visual-kubernetes-golden');
+
+    anchorClick.mockRestore();
   });
 
   it('saves restores and deletes workspace snapshots from history', async () => {

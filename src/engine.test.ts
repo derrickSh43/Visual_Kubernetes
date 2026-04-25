@@ -1,4 +1,4 @@
-import { createNodeTemplate, starterArchitecture } from './data';
+import { builtinGraphTemplates, createNodeTemplate, starterArchitecture } from './data';
 import {
   canConnectNodes,
   detectPattern,
@@ -391,6 +391,55 @@ describe('architecture engine', () => {
     ]));
     expect(files.find((file) => file.path === 'k8s/prod/clusters/west-eks/kubeconfig-context.env')?.content).toContain('REGION=us-west-2');
     expect(messages).toEqual(expect.arrayContaining([expect.stringContaining('crosses clusters')]));
+  });
+
+  it('round-trips the microservices template through generated export files', () => {
+    const template = builtinGraphTemplates.find((entry) => entry.id === 'template-microservices-starter')!;
+    const roundTrippedWorkspace = JSON.parse(JSON.stringify(template.workspace)) as typeof template.workspace;
+    const messages = validateArchitecture(roundTrippedWorkspace.model);
+    const files = generateProjectFiles(roundTrippedWorkspace.model);
+    const paths = files.map((file) => file.path);
+
+    expect(roundTrippedWorkspace.model.name).toBe('Checkout Platform');
+    expect(messages.filter((issue) => issue.level === 'error')).toHaveLength(0);
+    expect(paths).toContain('k8s/prod/kustomization.yaml');
+    expect(paths).toContain('terraform/prod/main.tf');
+    expect(files.find((file) => file.path === 'README.md')?.content).toContain('Checkout Platform');
+  });
+
+  it('generates documents for a 50-plus node graph without dropping ownership metadata', () => {
+    const nodes = Array.from({ length: 55 }, () => createNodeTemplate('service', 'scale-test'));
+    const model = {
+      ...starterArchitecture,
+      name: 'Scale Test',
+      defaultNamespace: 'scale-test',
+      nodes,
+      edges: nodes.slice(0, -1).map((node, index) => ({
+        id: `scale-edge-${index}`,
+        from: node.id,
+        to: nodes[index + 1]!.id,
+        type: 'http' as const,
+        latencyBudgetMs: 100,
+        networkPolicy: 'allow' as const,
+      })),
+      clusters: [
+        {
+          id: 'cluster-scale',
+          name: 'Scale EKS',
+          provider: 'aws' as const,
+          region: 'us-east-1',
+          workerCount: 10,
+          nodeIds: nodes.map((node) => node.id),
+        },
+      ],
+    };
+
+    const documents = generateKubernetesDocuments(model);
+    const deploymentDocuments = documents.filter((document) => document.kind === 'Deployment');
+
+    expect(documents.length).toBeGreaterThan(55);
+    expect(deploymentDocuments).toHaveLength(55);
+    expect(deploymentDocuments.every((document) => document.ownerNodeIds?.length === 1)).toBe(true);
   });
 
   it('surfaces hardened validation for incomplete and risky runtime models', () => {

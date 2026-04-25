@@ -330,6 +330,13 @@ export function App() {
   const snapshotSequenceRef = useRef(0);
   const undoStackRef = useRef<WorkspaceState[]>([]);
   const redoStackRef = useRef<WorkspaceState[]>([]);
+  const shortcutActionsRef = useRef({
+    save: () => {},
+    find: () => {},
+    undo: () => {},
+    redo: () => {},
+    close: () => {},
+  });
 
   const model = workspace.model;
   const resolvedModel = useMemo(() => getResolvedModel(model), [model]);
@@ -490,7 +497,70 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    shortcutActionsRef.current = {
+      save: () => {
+        createWorkspaceSnapshot('Keyboard save');
+        setActionStatus('Saved local workspace snapshot from keyboard shortcut.');
+      },
+      find: openFindCommand,
+      undo: undoWorkspaceChange,
+      redo: redoWorkspaceChange,
+      close: () => {
+        setFindOpen(false);
+        setBlueprintSettingsOpen(false);
+        setClusterDefaultsOpen(false);
+        setPlayPreviewOpen(false);
+        setHelpOpen(false);
+        setTemplatesOpen(false);
+        setOpenMenu(null);
+        setCanvasConnectMode(false);
+        setDragConnection(null);
+      },
+    };
+  });
+
+  useEffect(() => {
+    function isTypingTarget(target: EventTarget | null) {
+      if (!(target instanceof HTMLElement)) {
+        return false;
+      }
+      return target.matches('input, textarea, select, [contenteditable="true"]');
+    }
+
     function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        shortcutActionsRef.current.close();
+        return;
+      }
+
+      if ((event.ctrlKey || event.metaKey) && !isTypingTarget(event.target)) {
+        const key = event.key.toLowerCase();
+        if (key === 's') {
+          event.preventDefault();
+          shortcutActionsRef.current.save();
+          return;
+        }
+        if (key === 'f') {
+          event.preventDefault();
+          shortcutActionsRef.current.find();
+          return;
+        }
+        if (key === 'z') {
+          event.preventDefault();
+          if (event.shiftKey) {
+            shortcutActionsRef.current.redo();
+          } else {
+            shortcutActionsRef.current.undo();
+          }
+          return;
+        }
+        if (key === 'y') {
+          event.preventDefault();
+          shortcutActionsRef.current.redo();
+          return;
+        }
+      }
+
       if (event.code === 'Space') {
         setSpacePressed(true);
       }
@@ -929,6 +999,8 @@ export function App() {
     }));
 
     setSelectedNodeId(node.id);
+    setRightPanelTab('inspector');
+    setRightRailOpen(true);
     setEdgeDraft((current) => ({
       ...current,
       from: previousSelectedNodeId || node.id,
@@ -2293,8 +2365,18 @@ export function App() {
                     };
                     event.currentTarget.setPointerCapture(event.pointerId);
                   }}
+                  onKeyDown={(event) => {
+                    if (event.key !== 'Enter' && event.key !== ' ') {
+                      return;
+                    }
+                    event.preventDefault();
+                    event.stopPropagation();
+                    handleCanvasNodeClick(node.id);
+                  }}
                   className="node-group"
-                  aria-label={node.name}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Select ${node.name}`}
                 >
                   <rect
                     x={position.x}

@@ -83,7 +83,7 @@ Ordered for minimum rework and natural dependency flow.
 - Play → read-only live-preview YAML with diff markers
 - **Why tenth:** all underlying systems exist; this is glue.
 
-## 11. Review pass + golden E2E
+## 11. Review pass + golden E2E [done]
 - Golden path test (Playwright or vitest+jsdom): load "microservices starter" template → zoom out → add NetworkPolicy node → connect to a service → save snapshot → export ZIP.
 - Re-audit left-rail overlap after all new sections land.
 - Keyboard-shortcut consistency + accessibility (ARIA, focus order).
